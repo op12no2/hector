@@ -10,8 +10,9 @@ Hector, a small hexapod: 6 legs, 2 DOF each, 12 Waveshare SC09 bus servos. `hect
 
 - **Host:** Raspberry Pi 5 (where Claude Code runs) via the Waveshare Bus Servo Adapter (A) over USB, `/dev/ttyACM0` (stable path `/dev/serial/by-id/usb-1a86_USB_Single_Serial_*`), jumper in B, 1 Mbps. The README lists an M5Stack ATOM S3R as the eventual on-board controller; the gait code has no I/O of its own besides `send_pose()`, to ease a port.
 - **Servos:** SC09, 300° over 0..1023 (0.293°/step), 2.3 kg·cm. Supply is a 2S LiPo straight to the servos (rated 4.8–8.4 V).
+- **Geometry:** `cad/README.md` has the parts, how they fit together, and the foot position against `height`. The parts share one coordinate frame. To measure the STEP files, `pip install cadquery-ocp` (Open CASCADE; aarch64 wheels exist) into a venv. Its OCP 8 API needs `Bnd_Box.CornerMin/CornerMax`, not `Get()`, and `TopoDS.Face`, not `Face_s`. All-up weight is about 500 g.
 - **Legs:** hip (yaw) servos are ids 1–6, lift servos 7–12; leg n = hip n + lift n+6. Nominal (stand) position is 511 for all. Lifts can go up to the servo limit but only about 50 steps below 511 before the leg hits the chassis (the user judges 50 itself OK); `DOWN_MAX` (50) clamps that in `send_pose()`. `height` runs from -`SPLAY_MAX` (-150: stance legs 150 above centre, body lower, legs splayed) to `DOWN_MAX`. Hips can easily do 300 either way; `HIP_MAX` (150) clamps them, as neighbouring legs can meet.
-- **Overload protection** (Waveshare's SCS memory table, https://files.waveshare.com/upload/5/5c/SCS_Series_Memory_Table_Analysis.xls; the SC09s here hold its defaults): if a servo's load (0x3C, the drive duty cycle in 0.1%) stays over the overload torque (0x27, 80%) for the protection time (0x26, 100 × 40 ms = 4 s), its output drops to the protection torque (0x25, 20%) and its status reports overload (bit 5). Unloading conditions (0x13) = 0x20, i.e. only overload protection enabled. A lift servo is loaded all the time its foot is down, so standing still and slow gaits (a wave stance at the default 800 ms step is 4.0 s) are the risk, more than fast ones.
+- **Overload protection** (Waveshare's SCS memory table, https://files.waveshare.com/upload/5/5c/SCS_Series_Memory_Table_Analysis.xls; the SC09s here hold its defaults): if a servo's load (0x3C, the drive duty cycle in 0.1%) stays over the overload torque (0x27, 80%) for the protection time (0x26, 100 × 40 ms = 4 s), its output drops to the protection torque (0x25, 20%) and its status reports overload (bit 5). Unloading conditions (0x13) = 0x20, i.e. only overload protection enabled. A lift servo is loaded all the time its foot is down, so standing still and slow gaits (a wave stance at an 800 ms step is 4.0 s) are the risk, more than fast ones.
 - **Servo 9** (the lift of leg 3, LR) is broken: it goes into overload protection and sags (found at 549 against a goal of 511, at 20% load). A replacement was ordered on 2026-09-24 (it will need `setid 1 9`). Until then, ignore its overload reports and the limp on that corner; don't add workarounds for it.
 - **Layout and directions:** `legs[]` (layout, `hip_dir`, `lift_dir`) as first written walked the robot correctly without changes, so the guesses were right. If a leg is rebuilt, check it with `legtest` (lift of only 30, within the 50-step chassis margin) before walking: a wrong `lift_dir` would drive the swing legs down into the chassis.
 
@@ -24,6 +25,10 @@ echo "walk 2" | ./hector           # non-tty stdin works for scripted commands
 ```
 
 Keep the build warning-free under `-Wall -Wextra`. Walking can only really be verified on the robot; if you can't test on it, say so. Never make it move unless the user is there: it can walk off the desk.
+
+## Git
+
+The repo is https://github.com/op12no2/hector (private). Commit and push to `origin main` whenever a change is done and tested; no need to ask first. If it could only be tested off the robot (e.g. against a fake bus), say so in the commit message. Keep README, `help()` and this file in step with the code in the same commit. The user sometimes adds files through the GitHub web UI, so pull before starting work.
 
 ## Architecture (hexapod section)
 

@@ -28,16 +28,16 @@ Leg *n* is hip (yaw) servo *n* and lift servo *n*+6. Where each leg is, and whic
 | Command | Description |
 |---|---|
 | `stand [ms]` | all feet down, hips centred, taking ms (default 1000) |
-| `legtest [1-6]` | each leg in turn (or one, by hip id): up 30, forward 60, back, down |
+| `legtest [1-6]` | each leg in turn (or one, by hip id): lift servo up to 700, forward 80, back, down to its stance pose; the other legs stay where they are |
 | `walk [cycles] [stride] [turn]` | stand, then walk with the current gait; stride < 0 walks backwards, turn > 0 turns left (stride 0 turns on the spot); with no cycles it walks until a key is pressed; a key stops it gracefully (legs step back to centre), ctrl-c freezes it where it is; afterwards it prints each servo's peak load (a servo held over 80% for 4 s drops to 20% torque) |
 | `set [name value]` | list or set walk parameters (below) |
 
 | Parameter | Default | |
 |---|---|---|
-| `gait` | tripod | `wave` (1 leg up at a time), `ripple` (2) or `tripod` (3) |
-| `step` | 1000 | ms each leg spends in the air (a cycle is 6 steps in wave, 3 in ripple, 2 in tripod) |
-| `stride` | 100 | hip swing either side of centre, servo steps (0.29° each) |
-| `lift` | 100 | foot lift during a step, steps |
-| `height` | -60 | legs this far below centre when standing, -150..50: > 0 raises the body, < 0 lowers it with the legs splayed (the legs reach the chassis at about 50 below) |
+| `gait` | wave | `wave` (1 leg up at a time), `ripple` (2) or `tripod` (3) |
+| `step` | 800 | ms each leg spends in the air (a cycle is 6 steps in wave, 3 in ripple, 2 in tripod) |
+| `stride` | 50 | hip swing either side of centre, servo steps (0.29° each) |
+| `lift` | 70 | foot lift during a step, steps |
+| `height` | 0 | legs this far below centre when standing, -150..50: > 0 raises the body, < 0 lowers it with the legs splayed (the legs reach the chassis at about 50 below) |
 
 First run: prop the body up so the feet are off the ground, `legtest`, and check that each leg lifts *up* and swings *forward*, and that the leg that moves is the one named. Fix `legs[]` if not. Then put it down and `walk 2`.

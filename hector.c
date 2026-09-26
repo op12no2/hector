@@ -321,7 +321,7 @@ static void help(void)
     "\n"
     "hexapod (leg n: hip id n, lift id n+6; layout and directions in legs[] in hector.c):\n"
     "stand [ms]                all feet down, hips centred, taking ms (default 1000)\n"
-    "legtest [1-6]             each leg in turn (or one, by hip id): up 30, forward 60, back, down\n"
+    "legtest [1-6]             each leg in turn (or one, by hip id): up to 700, forward 80, back, down; the others stay put\n"
     "walk [cycles] [stride] [turn]   stand, then walk with the current gait; stride < 0 walks backwards,\n"
     "                          turn > 0 turns left (stride 0 turns on the spot); no cycles = until a key;\n"
     "                          a key stops (it finishes the step and brings the legs to centre), ctrl-c freezes\n"
@@ -469,7 +469,7 @@ static const struct gait {
 };
 
 /* walk parameters (the set command) */
-static int gait = 2, step_ms = 1000, stride = 100, lift = 100, height = -60;   /* a slow, low, splayed tripod that looks organic */
+static int gait = 0, step_ms = 800, stride = 50, lift = 70, height = 0;       /* gentle first-walk settings, for a new body */
 static const struct param { const char *name; int *v, min, max; const char *what; } params[] = {
     { "gait",   &gait,    0,   2,        "wave, ripple or tripod (1, 2 or 3 legs up at a time)" },
     { "step",   &step_ms, 200, 5000,     "ms each leg spends in the air" },
@@ -500,18 +500,31 @@ static const char *leg_name(const struct leg *L)
     return s;
 }
 
+/* a leg's x/z as its hip and lift goal positions */
+static void leg_goals(const struct leg *L, int *hip, int *lift)
+{
+    *hip = CENTRE + L->hip_trim + L->hip_dir * lround(clampd(L->x, -HIP_MAX, HIP_MAX));
+    *lift = CENTRE + L->lift_trim + L->lift_dir * lround(clampd(L->z - height, -DOWN_MAX, UP_MAX));
+}
+
 /* every leg's x/z as goal positions, in one sync write with goal time tm ms */
 static void send_pose(int tm)
 {
     int ids[12], pos[12];
     for (int i = 0; i < 6; i++) {
-        const struct leg *L = &legs[i];
-        ids[i] = L->hip;
-        pos[i] = CENTRE + L->hip_trim + L->hip_dir * lround(clampd(L->x, -HIP_MAX, HIP_MAX));
-        ids[i + 6] = L->lift;
-        pos[i + 6] = CENTRE + L->lift_trim + L->lift_dir * lround(clampd(L->z - height, -DOWN_MAX, UP_MAX));
+        ids[i] = legs[i].hip;
+        ids[i + 6] = legs[i].lift;
+        leg_goals(&legs[i], &pos[i], &pos[i + 6]);
     }
     sync_move(ids, 12, pos, tm, 0);
+}
+
+/* one leg's x/z, leaving the others where they are */
+static void send_leg(const struct leg *L, int tm)
+{
+    int ids[2] = { L->hip, L->lift }, pos[2];
+    leg_goals(L, &pos[0], &pos[1]);
+    sync_move(ids, 2, pos, tm, 0);
 }
 
 /* read voltage and temperature from all 12 servos; -1 if any doesn't reply */
@@ -543,11 +556,15 @@ static int stand(int ms)
     return 0;
 }
 
-/* each leg in turn (or just the one with hip id `only`): up, forward, back, down */
+/*
+ * Each leg in turn (or just the one with hip id `only`): up, forward, back,
+ * down (to its stance pose). Only the leg being tested moves.
+ */
 static void legtest(int only)
 {
-    static const double seq[4][2] = { { 0, 30 }, { 60, 30 }, { 0, 30 }, { 0, 0 } };   /* x, z */
-    if (stand(1000)) return;
+    double up = 700 - CENTRE + height;      /* lift at 700 (189 above centre, for lift_dir +1) */
+    const double seq[4][2] = { { 0, up }, { 80, up }, { 0, up }, { 0, 0 } };   /* x, z */
+    if (check_servos()) return;
     for (int i = 0; i < 6; i++) {
         struct leg *L = &legs[i];
         if (only && L->hip != only) continue;
@@ -555,7 +572,7 @@ static void legtest(int only)
         fflush(stdout);
         for (int k = 0; k < 4; k++) {
             L->x = seq[k][0]; L->z = seq[k][1];
-            send_pose(400);
+            send_leg(L, 400);
             msleep(700);
         }
     }

@@ -46,5 +46,5 @@ Measured by turning the parts in the assembly, so only as good as the "as drawn 
 
 - **Lift, foot down (`height` > 0):** the leg reaches the outer ring of the plate at about 26° (89 steps). The old body measured 92 steps the same way, yet the legs met the chassis at about 50 on the robot, so the drawn pose is probably not exactly 511; expect about the same margin as before.
 - **Lift, foot up:** nothing in the way.
-- **Hip, towards the side of the hip the leg plate is on:** the leg's lower half reaches the outer ring, sooner the lower the foot: about 61 steps at `height` +50, 123 at 0, 177 at −60 and 218 at −100 (the old body: 75, 137 and 198). The other way it's clear to about 90°.
+- **Hip, towards the side of the hip the leg plate is on:** the leg's lower half reaches the outer ring, sooner the lower the foot: about 61 steps at `height` +50, 123 at 0, 177 at −60 and 218 at −100 (the old body: 75, 137 and 198). The other way it's clear to about 90°. All six legs are fitted the same way round, so that's the same sense of rotation for every hip (anticlockwise from above in these files): forward on one side of the robot and back on the other. As `hip_dir` is −1 on the left and +1 on the right, it's also either a higher position for every hip or a lower one.
 - **Neighbouring legs:** they don't meet, with each hip turned up to 118° towards the other.

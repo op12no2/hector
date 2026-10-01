@@ -1,0 +1,149 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 1110 660" width="1110" height="660" font-family="Helvetica, Arial, sans-serif" font-size="13">
+  <defs>
+    <g id="gnd" stroke="#222" stroke-width="1.8" fill="none">
+      <line x1="0" y1="0" x2="0" y2="6"/>
+      <line x1="-10" y1="6" x2="10" y2="6"/>
+      <line x1="-6" y1="10" x2="6" y2="10"/>
+      <line x1="-2" y1="14" x2="2" y2="14"/>
+    </g>
+  </defs>
+  <style>
+    .box { fill: #f6f5ef; stroke: #222; stroke-width: 1.8; }
+    .ext { fill: #fff; stroke: #888; stroke-width: 1.4; stroke-dasharray: 5 4; }
+    .w { fill: none; stroke: #222; stroke-width: 1.8; }
+    .bat { fill: none; stroke: #c0392b; stroke-width: 2.4; }
+    .v5 { fill: none; stroke: #d35400; stroke-width: 2.2; }
+    .tx { fill: none; stroke: #1f6fb2; stroke-width: 2.2; }
+    .rx { fill: none; stroke: #23854a; stroke-width: 2.2; }
+    .t { fill: #222; }
+    .s { fill: #444; font-size: 11.5px; }
+    .b { font-weight: bold; }
+    .m { text-anchor: middle; }
+    .e { text-anchor: end; }
+  </style>
+
+  <rect x="0" y="0" width="1110" height="660" fill="#ffffff"/>
+
+  <text x="30" y="36" class="t b" font-size="18">Hector: ATOM S3R wiring</text>
+  <text x="30" y="56" class="s">recommended; every ground symbol is one common ground</text>
+
+  <!-- battery B1 -->
+  <path class="bat" d="M80,170 V90 H132"/>
+  <line x1="60" y1="170" x2="100" y2="170" stroke="#222" stroke-width="2"/>
+  <line x1="70" y1="182" x2="90" y2="182" stroke="#222" stroke-width="4"/>
+  <line x1="60" y1="198" x2="100" y2="198" stroke="#222" stroke-width="2"/>
+  <line x1="70" y1="210" x2="90" y2="210" stroke="#222" stroke-width="4"/>
+  <path class="w" d="M80,210 V240"/>
+  <use xlink:href="#gnd" x="80" y="240"/>
+  <text x="104" y="174" class="t b">+</text>
+  <text x="112" y="194" class="t b">B1 2S LiPo</text>
+  <text x="112" y="210" class="s">7.4 V nom. (6.0–8.4 V)</text>
+
+  <!-- SW1 -->
+  <circle cx="135" cy="90" r="3" fill="#fff" stroke="#222" stroke-width="1.6"/>
+  <circle cx="175" cy="90" r="3" fill="#fff" stroke="#222" stroke-width="1.6"/>
+  <line x1="137" y1="88" x2="172" y2="74" stroke="#222" stroke-width="1.8"/>
+  <text x="155" y="116" class="s m">SW1 switch</text>
+
+  <!-- F1 -->
+  <path class="bat" d="M178,90 H220"/>
+  <rect x="220" y="83" width="50" height="14" fill="#fff" stroke="#222" stroke-width="1.6"/>
+  <line x1="220" y1="90" x2="270" y2="90" stroke="#222" stroke-width="1.2"/>
+  <text x="245" y="74" class="s m">F1 ≈5 A (optional)</text>
+
+  <!-- VBAT -->
+  <path class="bat" d="M270,90 H620"/>
+  <text x="330" y="82" class="t b">VBAT</text>
+  <circle cx="420" cy="90" r="4" fill="#c0392b"/>
+  <path class="bat" d="M420,90 V410"/>
+
+  <!-- adapter -->
+  <text x="620" y="52" class="t b">Waveshare Bus Servo Adapter (A)</text>
+  <rect class="box" x="620" y="60" width="280" height="270"/>
+  <text x="630" y="94" class="s">+ (screw terminal / DC jack)</text>
+  <text x="630" y="134" class="s">−</text>
+  <path class="w" d="M620,130 H590 V150"/>
+  <use xlink:href="#gnd" x="590" y="150"/>
+  <text x="630" y="168" class="s">on-board 5 V / 3.3 V not brought out</text>
+  <text x="630" y="186" class="s">UART side is 3.3 V logic</text>
+  <text x="630" y="240" class="t"><tspan class="b">Jumper A:</tspan> H2 ↔ bus (ATOM)</text>
+  <text x="630" y="258" class="t"><tspan class="b">Jumper B:</tspan> USB ↔ bus (Pi)</text>
+  <text x="890" y="114" class="s e">USB-C</text>
+  <text x="890" y="204" class="s e">servo ports</text>
+  <text x="680" y="318" class="t b m">H2</text>
+  <text x="760" y="318" class="s m">TXD</text>
+  <text x="810" y="318" class="s m">RXD</text>
+  <text x="870" y="318" class="s m">GND</text>
+  <path class="w" d="M870,330 V350"/>
+  <use xlink:href="#gnd" x="870" y="350"/>
+
+  <!-- Pi and servos -->
+  <path class="w" d="M900,110 H950"/>
+  <rect class="ext" x="950" y="90" width="140" height="42"/>
+  <text x="1020" y="108" class="t m">Pi 5 USB</text>
+  <text x="1020" y="124" class="s m">bench, jumper B</text>
+  <path class="w" d="M900,200 H950"/>
+  <rect class="ext" x="950" y="168" width="140" height="62"/>
+  <text x="1020" y="188" class="t b m">12 × SC09</text>
+  <text x="1020" y="204" class="s m">ids 1–12</text>
+  <text x="1020" y="220" class="s m">daisy-chained</text>
+
+  <!-- UART -->
+  <path class="tx" d="M760,330 V400"/>
+  <path class="rx" d="M810,330 V400"/>
+  <text x="752" y="388" class="s e">ATOM TX → TXD</text>
+  <text x="818" y="388" class="s">RXD → ATOM RX</text>
+
+  <!-- U1 buck -->
+  <rect class="box" x="380" y="410" width="120" height="90"/>
+  <text x="370" y="422" class="t b e">U1 MPM3610</text>
+  <text x="370" y="438" class="s e">Adafruit 5 V buck</text>
+  <text x="370" y="453" class="s e">6–21 V in, 1.2 A</text>
+  <text x="420" y="428" class="s m">Vin</text>
+  <text x="492" y="444" class="s e">5V</text>
+  <text x="388" y="474" class="s">En</text>
+  <text x="460" y="494" class="s m">GND</text>
+  <path class="w" d="M380,470 H362"/>
+  <path d="M356,464 l12,12 M368,464 l-12,12" stroke="#222" stroke-width="1.6"/>
+  <text x="350" y="490" class="s e">NC (pulled up)</text>
+  <path class="w" d="M460,500 V520"/>
+  <use xlink:href="#gnd" x="460" y="520"/>
+
+  <!-- D1 -->
+  <path class="v5" d="M500,440 H570"/>
+  <polygon points="570,429 570,451 590,440" fill="#222"/>
+  <line x1="590" y1="429" x2="590" y2="451" stroke="#222" stroke-width="2.4"/>
+  <path class="v5" d="M590,440 H690"/>
+  <text x="580" y="420" class="t b m">D1 SS14</text>
+  <text x="580" y="470" class="s m">Schottky (1N5817)</text>
+  <text x="640" y="432" class="s m">≈4.7 V</text>
+
+  <!-- ATOM -->
+  <rect class="box" x="690" y="400" width="280" height="160"/>
+  <text x="760" y="418" class="s m">G38</text>
+  <text x="810" y="418" class="s m">G39</text>
+  <text x="698" y="444" class="s">5V</text>
+  <text x="698" y="494" class="s">GND</text>
+  <path class="w" d="M690,490 H665 V505"/>
+  <use xlink:href="#gnd" x="665" y="505"/>
+  <text x="845" y="458" class="t b m">M5Stack ATOM S3R</text>
+  <text x="845" y="476" class="s m">ESP32-S3</text>
+  <text x="845" y="494" class="s m">Serial1: rx 39, tx 38, 1 Mbps</text>
+  <text x="845" y="512" class="s m">G5–G8 free</text>
+  <text x="845" y="548" class="s m">Port A (G2 SDA, G1 SCL)</text>
+  <text x="962" y="444" class="s e">USB-C</text>
+  <path class="w" d="M970,440 H990"/>
+  <rect class="ext" x="990" y="418" width="110" height="44"/>
+  <text x="1045" y="436" class="t m">PC / Pi</text>
+  <text x="1045" y="452" class="s m">flash + console</text>
+  <path class="w" d="M810,560 V590"/>
+  <rect class="ext" x="740" y="590" width="140" height="36"/>
+  <text x="810" y="613" class="s m">sensor (I2C, TBD)</text>
+
+  <!-- notes -->
+  <text x="30" y="560" class="t b">Notes</text>
+  <text x="30" y="580" class="s">G39, G38, 5V, GND are the ATOM's right-hand header, in that order: one 4-way housing.</text>
+  <text x="30" y="598" class="s">H2's RXD/TXD are named for the host: RXD → ATOM RX, TXD → ATOM TX. Run GND with them.</text>
+  <text x="30" y="616" class="s">D1: the ATOM's 5V pin is its USB VBUS; it stops U1 and a USB port feeding each other.</text>
+  <text x="30" y="634" class="s">Battery voltage: read it from the servos (no divider needed).</text>
+</svg>

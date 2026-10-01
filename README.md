@@ -8,7 +8,12 @@ A little hexapod.
 - [M5Stack ATOM S3R](https://thepihut.com/products/atoms3r-development-kit-with-0-85-display-8mb-psram)
 - [MPM3610 5V Buck Converter Breakout - 21V In 5V Out at 1.2A](https://thepihut.com/products/adafruit-mpm3610-5v-buck-converter-breakout-21v-in-5v-out-at-1-2a)
 - 2S LiPo
+- Small Schottky diode (SS14, 1N5817), a switch (or XT30 plug) and optionally a ~5 A fuse
 - Sensor TBD
+
+### Wiring
+
+See [wiring.md](wiring.md): the ATOM drives the bus through the adapter's UART header (jumper in A), powered from the battery through the buck and a diode, which leaves its USB-C free for flashing.
 
 ### Chassis
 

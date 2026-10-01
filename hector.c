@@ -300,7 +300,8 @@ static void help(void)
     "                          speed = max speed in steps/s, 0..1023 (0 = full speed, reg 0x2E); both default 0;\n"
     "                          a list of ids is sent as one sync write so they all start together;\n"
     "                          warns if the goal is outside an id's angle limits (the servo clamps it);\n"
-    "                          waits for the move to finish, reports ids off goal by more than their dead zone\n"
+    "                          waits for the move to finish, reports ids off goal by more than their dead zone;\n"
+    "                          each id's offset (offset[] in hector.c, e.g. 7 and 11 +20) is added to pos\n"
     "torque <id> 0|1           torque enable\n"
     "rb <id> <addr>            read byte\n"
     "rw <id> <addr>            read 16-bit\n"
@@ -379,14 +380,14 @@ static void sync_move(const int *ids, int nid, const int *pos, int tm, int sp)
  * overshoot the flag drops while the servo is still easing back. Gives up
  * after time + 3 s.
  */
-static void verify_move(const int *ids, int nid, int goal, int tm)
+static void verify_move(const int *ids, int nid, const int *goal, int tm)
 {
     int tol[254], gl[254], still[254], last[254], done[254], left = nid;
     for (int i = 0; i < nid; i++) {
         unsigned char b[REG_DEADZONE_CCW - REG_MIN_ANGLE + 1];
         still[i] = 0;
         last[i] = -1;
-        gl[i] = goal;
+        gl[i] = goal[i];
         done[i] = read_regs(ids[i], REG_MIN_ANGLE, sizeof b, b) != (int)sizeof b;   /* no reply: already reported */
         left -= done[i];
         if (done[i]) continue;
@@ -395,9 +396,9 @@ static void verify_move(const int *ids, int nid, int goal, int tm)
         int mn = get16(R(REG_MIN_ANGLE)), mx = get16(R(REG_MAX_ANGLE));
 #undef R
         tol[i] = cw > ccw ? cw : ccw;
-        if (mn || mx) gl[i] = goal < mn ? mn : goal > mx ? mx : goal;   /* 0/0 = motor mode */
-        if (gl[i] != goal)
-            printf("id %d: goal %d outside limits %d..%d, clamped to %d\n", ids[i], goal, mn, mx, gl[i]);
+        if (mn || mx) gl[i] = goal[i] < mn ? mn : goal[i] > mx ? mx : goal[i];   /* 0/0 = motor mode */
+        if (gl[i] != goal[i])
+            printf("id %d: goal %d outside limits %d..%d, clamped to %d\n", ids[i], goal[i], mn, mx, gl[i]);
     }
     for (int ms = 0; left; ms += 20) {
         usleep(20000);
@@ -433,25 +434,31 @@ static void verify_move(const int *ids, int nid, int goal, int tm)
 #define TICK_MS  20     /* pose update period while walking */
 
 /*
+ * Per-id offsets, added to every goal position sent: move's and the legs'.
+ * move 7 511 sends 531. Reads (pos, stat, move's check) are the servo's own
+ * positions. Lifts 7 and 11 are +20 to level the legs in the stand pose.
+ */
+static const int offset[254] = { [7] = 20, [11] = 20 };
+
+/*
  * The legs. Hips (yaw) are ids 1-6 and lifts 7-12; side and row say where each
  * leg is, which is all the gaits need. hip_dir is +1 if a higher position swings
  * the foot forward (towards the head), lift_dir +1 if a higher position raises
- * the foot; legtest shows both. Trims shift a servo's 511 centre.
+ * the foot; legtest shows both.
  */
 static struct leg {
     int side, row;              /* side 0 left, 1 right; row 0 front, 1 middle, 2 rear */
     int hip, lift;              /* servo ids */
     int hip_dir, lift_dir;
-    int hip_trim, lift_trim;
     double x, z;                /* hip swing (+ forward) and foot lift (+ up) from the stance pose, steps */
 } legs[6] = {
-    /* side row hip lift hip_dir lift_dir hip_trim lift_trim x z */
-    { 0, 0, 1,  7, -1, 1, 0, 0, 0, 0 },     /* LF */
-    { 0, 1, 2,  8, -1, 1, 0, 0, 0, 0 },     /* LM */
-    { 0, 2, 3,  9, -1, 1, 0, 0, 0, 0 },     /* LR; servo 9 is due for replacement (less accurate) */
-    { 1, 0, 4, 10,  1, 1, 0, 0, 0, 0 },     /* RF */
-    { 1, 1, 5, 11,  1, 1, 0, 0, 0, 0 },     /* RM */
-    { 1, 2, 6, 12,  1, 1, 0, 0, 0, 0 },     /* RR */
+    /* side row hip lift hip_dir lift_dir x z */
+    { 0, 0, 1,  7, -1, 1, 0, 0 },     /* LF */
+    { 0, 1, 2,  8, -1, 1, 0, 0 },     /* LM */
+    { 0, 2, 3,  9, -1, 1, 0, 0 },     /* LR */
+    { 1, 0, 4, 10,  1, 1, 0, 0 },     /* RF */
+    { 1, 1, 5, 11,  1, 1, 0, 0 },     /* RM */
+    { 1, 2, 6, 12,  1, 1, 0, 0 },     /* RR */
 };
 
 /*
@@ -503,8 +510,8 @@ static const char *leg_name(const struct leg *L)
 /* a leg's x/z as its hip and lift goal positions */
 static void leg_goals(const struct leg *L, int *hip, int *lift)
 {
-    *hip = CENTRE + L->hip_trim + L->hip_dir * lround(clampd(L->x, -HIP_MAX, HIP_MAX));
-    *lift = CENTRE + L->lift_trim + L->lift_dir * lround(clampd(L->z - height, -DOWN_MAX, UP_MAX));
+    *hip = CENTRE + offset[L->hip] + L->hip_dir * lround(clampd(L->x, -HIP_MAX, HIP_MAX));
+    *lift = CENTRE + offset[L->lift] + L->lift_dir * lround(clampd(L->z - height, -DOWN_MAX, UP_MAX));
 }
 
 /* every leg's x/z as goal positions, in one sync write with goal time tm ms */
@@ -737,16 +744,15 @@ static int run(char **tok, int nt)
         int tm = arg(tok, 3, nt, 0, NULL), sp = arg(tok, 4, nt, 0, NULL);
         if (!ok || nid < 1) { puts("usage: move <id> <pos> [time] [speed]"); return 0; }
         if (pos < 0 || pos > 1023) printf("warning: pos %d outside 0..1023, servo will clamp to its limits\n", pos);
+        int goals[254];
+        for (int i = 0; i < nid; i++) goals[i] = pos + offset[ids[i]];
         if (nid == 1) {
             unsigned char b[6];
-            put16(b, pos); put16(b + REG_GOAL_TIME - REG_GOAL_POS, tm); put16(b + REG_GOAL_SPEED - REG_GOAL_POS, sp);
+            put16(b, goals[0]); put16(b + REG_GOAL_TIME - REG_GOAL_POS, tm); put16(b + REG_GOAL_SPEED - REG_GOAL_POS, sp);
             if (write_regs(ids[0], REG_GOAL_POS, b, 6)) return 0;
-        } else {
-            int goals[254];
-            for (int i = 0; i < nid; i++) goals[i] = pos;
-            sync_move(ids, nid, goals, tm, sp);
         }
-        verify_move(ids, nid, pos, tm);
+        else sync_move(ids, nid, goals, tm, sp);
+        verify_move(ids, nid, goals, tm);
     }
     else if (!strcmp(c, "torque")) write_u8(arg(tok, 1, nt, 1, NULL), REG_TORQUE_ENABLE, arg(tok, 2, nt, 1, NULL));
     else if (!strcmp(c, "rb")) {

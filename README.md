@@ -25,6 +25,8 @@ make
 
 Leg *n* is hip (yaw) servo *n* and lift servo *n*+6. Where each leg is, and which way each servo turns, is set in `legs[]` at the top of the hexapod section of `hector.c`.
 
+`offset[]`, just above it, is a per-servo offset added to every goal position sent, by `move` as well as the hexapod commands, so `move 7 511` sends 531. Lifts 7 and 11 are +20, which levels the legs in the stand pose. `pos`, `stat` and `move`'s check report the servo's actual position, with the offset included; `ww` to the goal register doesn't add it.
+
 | Command | Description |
 |---|---|
 | `stand [ms]` | all feet down, hips centred, taking ms (default 1000) |

@@ -25,13 +25,15 @@ make
 
 Leg *n* is hip (yaw) servo *n* and lift servo *n*+6. Where each leg is, and which way each servo turns, is set in `legs[]` at the top of the hexapod section of `hector.c`.
 
-`offset[]`, just above it, is a per-servo offset added to every goal position sent, by `move` as well as the hexapod commands, so with an offset of 20 on servo 7, `move 7 511` sends 531. Lifts 10 and 12 (right front and rear) are -20, which puts all six feet on the ground at 511. `pos`, `stat` and `move`'s check report the servo's actual position, with the offset included; `ww` to the goal register doesn't add it.
+`offset[]`, just above it, is a per-servo offset added to every goal position sent, by `move` as well as the hexapod commands, so with an offset of 20 on servo 7, `move 7 511` sends 531. The lifts' offsets come from `calibrate`. `offset` and `calibrate` change it until you exit; they print the table as a line of C to paste into `hector.c` to keep it. `pos`, `stat` and `move`'s check report the servo's actual position, with the offset included; `ww` to the goal register doesn't add it.
 
 | Command | Description |
 |---|---|
 | `stand [ms]` | all feet down, hips centred, taking ms (default 1000) |
 | `legtest [1-6]` | each leg in turn (or one, by hip id): lift servo up to 700, forward 80, back, down to its stance pose; the other legs stay where they are |
 | `ident [id]` | twitch each id (default 1-12) in turn, a second apart, to see which servo has which id: 30 steps up from where it is and back; it prints which leg `legs[]` says the id belongs to |
+| `offset [id val]` | show the per-servo offsets, or set one; the change lasts until exit |
+| `calibrate` | stand, then nudge the lift offsets, a step or two at a time from where they are, until all six feet carry the same load (within 1.5%); prints the offset table to paste into `hector.c` |
 | `walk [cycles] [stride] [turn]` | stand, then walk with the current gait; stride < 0 walks backwards, turn > 0 turns left (stride 0 turns on the spot); with no cycles it walks until a key is pressed; a key stops it gracefully (legs step back to centre), ctrl-c freezes it where it is; afterwards it prints each servo's peak load (a servo held over 80% for 4 s drops to 20% torque) |
 | `set [name value]` | list or set walk parameters (below) |
 

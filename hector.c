@@ -2,7 +2,7 @@
  * hector.c - Hector the hexapod: 12 Waveshare SC09 bus servos via a
  * Waveshare Bus Servo Adapter (A) / USB serial. Started as a copy of
  * ../servo/servo.c (the generic servo tester) and keeps all its commands;
- * the hexapod commands (stand, legtest, ident, walk, set) are at the end.
+ * the hexapod commands (stand, legtest, ident, offset, calibrate, walk, set) are at the end.
  *
  * Build:  make
  * Run:    ./hector [/dev/ttyACM0] [baud]
@@ -301,7 +301,7 @@ static void help(void)
     "                          a list of ids is sent as one sync write so they all start together;\n"
     "                          warns if the goal is outside an id's angle limits (the servo clamps it);\n"
     "                          waits for the move to finish, reports ids off goal by more than their dead zone;\n"
-    "                          each id's offset (offset[] in hector.c, e.g. 10 and 12 -20) is added to pos\n"
+    "                          each id's offset (offset[] in hector.c, set by calibrate) is added to pos\n"
     "torque <id> 0|1           torque enable\n"
     "rb <id> <addr>            read byte\n"
     "rw <id> <addr>            read 16-bit\n"
@@ -324,6 +324,9 @@ static void help(void)
     "stand [ms]                all feet down, hips centred, taking ms (default 1000)\n"
     "legtest [1-6]             each leg in turn (or one, by hip id): up to 700, forward 80, back, down; the others stay put\n"
     "ident [id]                twitch each id (default 1-12) in turn, 1 s apart: +30 from where it is and back\n"
+    "offset [id val]           show the per-id offsets added to goal positions, or set one (until exit)\n"
+    "calibrate                 stand, then nudge the lift offsets until all six feet carry the same load;\n"
+    "                          prints the offset table to paste into hector.c\n"
     "walk [cycles] [stride] [turn]   stand, then walk with the current gait; stride < 0 walks backwards,\n"
     "                          turn > 0 turns left (stride 0 turns on the spot); no cycles = until a key;\n"
     "                          a key stops (it finishes the step and brings the legs to centre), ctrl-c freezes\n"
@@ -437,9 +440,21 @@ static void verify_move(const int *ids, int nid, const int *goal, int tm)
 /*
  * Per-id offsets, added to every goal position sent: move's and the legs'.
  * With [7] = 20, move 7 511 sends 531. Reads (pos, stat, move's check) are the servo's own
- * positions. Lifts 10 and 12 (RF, RR) are -20: their feet were off the ground at 511.
+ * positions. The lifts' are from calibrate (2026-10-01, height 0).
+ * The offset and calibrate commands change it until exit; paste what they
+ * print here to keep it.
  */
-static const int offset[254] = { [10] = -20, [12] = -20 };
+static int offset[254] = { [7] = 4, [8] = -8, [9] = 3, [10] = -21, [11] = 3, [12] = -24 };
+
+/* the offset table as a line of C, to paste above */
+static void print_offsets(void)
+{
+    printf("static int offset[254] = {");
+    int n = 0;
+    for (int id = 0; id < 254; id++)
+        if (offset[id]) printf("%s [%d] = %d", n++ ? "," : "", id, offset[id]);
+    puts(n ? " };" : " 0 };");
+}
 
 /*
  * The legs. Hips (yaw) are ids 1-6 and lifts 7-12; side and row say where each
@@ -584,6 +599,66 @@ static void legtest(int only)
             msleep(700);
         }
     }
+}
+
+/*
+ * Even out the weight on the six feet, starting from the current offsets:
+ * stand, then repeatedly read each lift's load (averaged, signed so + is the
+ * foot pushing down), raise the feet of legs above the mean load and lower
+ * those below, by 1-2 steps a round, until all are within CAL_TOL of the mean
+ * or CAL_ROUNDS rounds have run. Keeps the round with the smallest spread.
+ * Only the lift offsets change, each by at most CAL_MAX.
+ */
+#define CAL_TOL    15   /* load units (0.1%) either side of the mean */
+#define CAL_ROUNDS 20
+#define CAL_MAX    30   /* steps any offset may move from where it started */
+
+static void calibrate(void)
+{
+    int start[6], best[6], bad = 0;
+    double bestspread = 1e9;
+    if (stand(1000)) return;
+    printf("calibrating at height %d; lift loads in %%, + = pushing down\n", height);
+    for (int i = 0; i < 6; i++) start[i] = best[i] = offset[legs[i].lift];
+    for (int round = 1; round <= CAL_ROUNDS; round++) {
+        msleep(500);
+        double ld[6] = {0}, mean = 0;
+        for (int s = 0; s < 5 && !bad; s++) {
+            for (int i = 0; i < 6 && !bad; i++) {
+                int v = 0;
+                bad = read_u16(legs[i].lift, REG_PRESENT_LOAD, &v);     /* prints no reply */
+                ld[i] += legs[i].lift_dir * (v & 0x400 ? -(v & 0x3FF) : v & 0x3FF) / 5.0;
+            }
+            msleep(40);
+        }
+        if (bad) break;
+        for (int i = 0; i < 6; i++) mean += ld[i] / 6;
+        double spread = 0;
+        for (int i = 0; i < 6; i++) if (fabs(ld[i] - mean) > spread) spread = fabs(ld[i] - mean);
+        printf("%2d:", round);
+        for (int i = 0; i < 6; i++) printf(" %d:%+d %.1f", legs[i].lift, offset[legs[i].lift], ld[i] / 10);
+        printf("  (mean %.1f, worst %.1f off)\n", mean / 10, spread / 10);
+        fflush(stdout);
+        if (mean < 20) { puts("hardly any load on the feet: is it standing on them?"); break; }
+        if (spread < bestspread) {
+            bestspread = spread;
+            for (int i = 0; i < 6; i++) best[i] = offset[legs[i].lift];
+        }
+        if (spread <= CAL_TOL) { puts("balanced"); break; }
+        if (round == CAL_ROUNDS) { puts("not balanced: keeping the best round"); break; }
+        for (int i = 0; i < 6; i++) {
+            double dev = ld[i] - mean;
+            int d = lround(clampd(dev / 30, -2, 2));
+            if (!d && fabs(dev) > CAL_TOL) d = dev > 0 ? 1 : -1;
+            int *o = &offset[legs[i].lift];
+            *o = lround(clampd(*o + legs[i].lift_dir * d, start[i] - CAL_MAX, start[i] + CAL_MAX));
+        }
+        send_pose(200);
+    }
+    for (int i = 0; i < 6; i++) offset[legs[i].lift] = best[i];
+    send_pose(200);
+    printf("offsets in use until exit; to keep them, put this in hector.c:\n");
+    print_offsets();
 }
 
 /*
@@ -877,6 +952,13 @@ static int run(char **tok, int nt)
         int ids[254], nid = parse_ids(nt > 1 ? tok[1] : "1-12", ids);
         if (nid < 1) { puts("usage: ident [id]"); return 0; }
         ident(ids, nid);
+    }
+    else if (!strcmp(c, "calibrate")) calibrate();
+    else if (!strcmp(c, "offset")) {
+        int ids[254], nid = nt > 1 ? parse_ids(tok[1], ids) : 0, v = arg(tok, 2, nt, 0, &ok);
+        if (nt > 1 && (nid < 1 || !ok)) { puts("usage: offset [id val]"); return 0; }
+        for (int i = 0; i < nid; i++) offset[ids[i]] = v;
+        print_offsets();
     }
     else if (!strcmp(c, "walk")) {
         int cycles = arg(tok, 1, nt, 0, NULL), str = arg(tok, 2, nt, stride, NULL), turn = arg(tok, 3, nt, 0, NULL);

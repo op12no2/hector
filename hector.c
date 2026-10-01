@@ -301,7 +301,7 @@ static void help(void)
     "                          a list of ids is sent as one sync write so they all start together;\n"
     "                          warns if the goal is outside an id's angle limits (the servo clamps it);\n"
     "                          waits for the move to finish, reports ids off goal by more than their dead zone;\n"
-    "                          each id's offset (offset[] in hector.c, e.g. 7 and 11 +20) is added to pos\n"
+    "                          each id's offset (offset[] in hector.c, e.g. 5 and 11 +20) is added to pos\n"
     "torque <id> 0|1           torque enable\n"
     "rb <id> <addr>            read byte\n"
     "rw <id> <addr>            read 16-bit\n"
@@ -435,10 +435,10 @@ static void verify_move(const int *ids, int nid, const int *goal, int tm)
 
 /*
  * Per-id offsets, added to every goal position sent: move's and the legs'.
- * move 7 511 sends 531. Reads (pos, stat, move's check) are the servo's own
- * positions. Lifts 7 and 11 are +20 to level the legs in the stand pose.
+ * move 5 511 sends 531. Reads (pos, stat, move's check) are the servo's own
+ * positions. Hip 5 and lift 11 (the RM leg) are +20, to even up the legs in the stand pose.
  */
-static const int offset[254] = { [7] = 20, [11] = 20 };
+static const int offset[254] = { [5] = 20, [11] = 20 };
 
 /*
  * The legs. Hips (yaw) are ids 1-6 and lifts 7-12; side and row say where each

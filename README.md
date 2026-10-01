@@ -31,6 +31,7 @@ Leg *n* is hip (yaw) servo *n* and lift servo *n*+6. Where each leg is, and whic
 |---|---|
 | `stand [ms]` | all feet down, hips centred, taking ms (default 1000) |
 | `legtest [1-6]` | each leg in turn (or one, by hip id): lift servo up to 700, forward 80, back, down to its stance pose; the other legs stay where they are |
+| `ident [id]` | twitch each id (default 1-12) in turn, a second apart, to see which servo has which id: 30 steps up from where it is and back; it prints which leg `legs[]` says the id belongs to |
 | `walk [cycles] [stride] [turn]` | stand, then walk with the current gait; stride < 0 walks backwards, turn > 0 turns left (stride 0 turns on the spot); with no cycles it walks until a key is pressed; a key stops it gracefully (legs step back to centre), ctrl-c freezes it where it is; afterwards it prints each servo's peak load (a servo held over 80% for 4 s drops to 20% torque) |
 | `set [name value]` | list or set walk parameters (below) |
 

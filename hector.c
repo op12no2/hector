@@ -2,7 +2,7 @@
  * hector.c - Hector the hexapod: 12 Waveshare SC09 bus servos via a
  * Waveshare Bus Servo Adapter (A) / USB serial. Started as a copy of
  * ../servo/servo.c (the generic servo tester) and keeps all its commands;
- * the hexapod commands (stand, legtest, walk, set) are at the end.
+ * the hexapod commands (stand, legtest, ident, walk, set) are at the end.
  *
  * Build:  make
  * Run:    ./hector [/dev/ttyACM0] [baud]
@@ -323,6 +323,7 @@ static void help(void)
     "hexapod (leg n: hip id n, lift id n+6; layout and directions in legs[] in hector.c):\n"
     "stand [ms]                all feet down, hips centred, taking ms (default 1000)\n"
     "legtest [1-6]             each leg in turn (or one, by hip id): up to 700, forward 80, back, down; the others stay put\n"
+    "ident [id]                twitch each id (default 1-12) in turn, 1 s apart: +30 from where it is and back\n"
     "walk [cycles] [stride] [turn]   stand, then walk with the current gait; stride < 0 walks backwards,\n"
     "                          turn > 0 turns left (stride 0 turns on the spot); no cycles = until a key;\n"
     "                          a key stops (it finishes the step and brings the legs to centre), ctrl-c freezes\n"
@@ -585,6 +586,35 @@ static void legtest(int only)
     }
 }
 
+/*
+ * Twitch each id in turn, a second apart, to see which servo has which id:
+ * +30 from wherever it is (up, for a lift with lift_dir +1) and back. Prints
+ * what legs[] says the id is first.
+ */
+static void ident(const int *ids, int nid)
+{
+    for (int i = 0; i < nid; i++) {
+        int id = ids[i], p;
+        const char *what = "not in legs[]";
+        char buf[16];
+        for (int k = 0; k < 6; k++)
+            if (legs[k].hip == id || legs[k].lift == id) {
+                snprintf(buf, sizeof buf, "%s %s", leg_name(&legs[k]), legs[k].hip == id ? "hip" : "lift");
+                what = buf;
+            }
+        if (read_u16(id, REG_PRESENT_POS, &p)) continue;    /* prints no reply */
+        printf("id %d (%s) at %d%s\n", id, what, p, status_tail(id));
+        fflush(stdout);
+        unsigned char b[4];
+        put16(b, p + 30); put16(b + 2, 150);
+        write_regs(id, REG_GOAL_POS, b, 4);
+        msleep(300);
+        put16(b, p);
+        write_regs(id, REG_GOAL_POS, b, 4);
+        msleep(700);
+    }
+}
+
 static volatile sig_atomic_t halted;
 static void on_sigint(int sig) { (void)sig; halted = 1; }
 
@@ -842,6 +872,11 @@ static int run(char **tok, int nt)
         int only = arg(tok, 1, nt, 0, NULL);
         if (only < 0 || only > 6) { puts("usage: legtest [hip id 1-6]"); return 0; }
         legtest(only);
+    }
+    else if (!strcmp(c, "ident")) {
+        int ids[254], nid = parse_ids(nt > 1 ? tok[1] : "1-12", ids);
+        if (nid < 1) { puts("usage: ident [id]"); return 0; }
+        ident(ids, nid);
     }
     else if (!strcmp(c, "walk")) {
         int cycles = arg(tok, 1, nt, 0, NULL), str = arg(tok, 2, nt, stride, NULL), turn = arg(tok, 3, nt, 0, NULL);

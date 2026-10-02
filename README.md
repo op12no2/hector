@@ -28,6 +28,17 @@ make
 ./hector [/dev/ttyACM0] [baud]     # default 1000000
 ```
 
+The same `hector.c` also builds for the ATOM S3R (ESP-IDF, in `atom/`), which drives the bus through the adapter's UART header (jumper in A, see [wiring.md](wiring.md)), with the REPL on the ATOM's USB:
+
+```
+cd atom
+. ~/esp/esp-idf/export.sh
+idf.py build
+idf.py -p /dev/serial/by-id/usb-Espressif_* flash monitor     # ctrl-] leaves the monitor
+```
+
+Every command works the same way there; `quit` has nothing to quit to, and changes to `offset[]` last until the ATOM resets. Any terminal on its USB port works as well as `idf.py monitor` (e.g. `picocom /dev/ttyACM0`), but opening the port with `idf.py monitor` resets the ATOM.
+
 Leg *n* is hip (yaw) servo *n* and lift servo *n*+6. Where each leg is, and which way each servo turns, is set in `legs[]` at the top of the hexapod section of `hector.c`.
 
 `offset[]`, just above it, is a per-servo offset added to every goal position sent, by `move` as well as the hexapod commands, so with an offset of 20 on servo 7, `move 7 511` sends 531. The lifts' offsets come from `calibrate`. `offset` and `calibrate` change it until you exit; they print the table as a line of C to paste into `hector.c` to keep it. `pos`, `stat` and `move`'s check report the servo's actual position, with the offset included; `ww` to the goal register doesn't add it.

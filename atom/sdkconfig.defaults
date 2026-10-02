@@ -1,0 +1,16 @@
+CONFIG_IDF_TARGET="esp32s3"
+
+# ATOM S3R: ESP32-S3-PICO-1-N8R8, 8 MB flash (the 8 MB PSRAM isn't used)
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+
+# The console is the S3's native USB-Serial/JTAG, the same cable used for flashing
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# 1 ms ticks: bus reply timeouts are a few ms, walk ticks 20 ms
+CONFIG_FREERTOS_HZ=1000
+
+# the REPL runs in the main task; verify_move and move have several int[254] on the stack
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# keep IDF's own logs out of the REPL
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y

@@ -8,6 +8,10 @@
  * Run:    ./hector [/dev/ttyACM0] [baud]
  * Then type commands on stdin ("help" lists them).
  *
+ * The same file builds for the ATOM S3R (ESP-IDF, atom/): the bus is then
+ * UART1 on G38/G39 into the adapter's UART header and the console is the
+ * ATOM's USB. Only the I/O section below differs (ESP_PLATFORM).
+ *
  * Protocol:
  *   TX: FF FF ID LEN INSTR PARAM... CHK     LEN = nparams + 2
  *   RX: FF FF ID LEN ERR   PARAM... CHK
@@ -15,18 +19,27 @@
  * 16-bit registers are high byte first.
  */
 #include <errno.h>
-#include <fcntl.h>
 #include <math.h>
-#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef ESP_PLATFORM
+#include "driver/gpio.h"
+#include "driver/uart.h"
+#include "driver/usb_serial_jtag.h"
+#include "driver/usb_serial_jtag_vfs.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#else
+#include <fcntl.h>
+#include <signal.h>
+#include <termios.h>
 #include <sys/select.h>
 #include <sys/time.h>
+#endif
 
 #define INST_PING       0x01
 #define INST_READ       0x02
@@ -52,7 +65,6 @@
 #define REG_TEMP          0x3F
 #define REG_MOVING        0x42
 
-static int fd = -1;
 static int verbose = 0;
 static int timeout_ms = 50;
 
@@ -65,6 +77,93 @@ static void die(const char *fmt, ...)
     va_list ap; va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap);
     fputc('\n', stderr); exit(1);
 }
+
+/*
+ * ---- I/O ----
+ * The servo bus (open_port, bus_flush, bus_write, read_bytes), the console
+ * (con_*) and timing (msleep, tick_*). Everything else is the same on the Pi
+ * and the ATOM.
+ */
+#ifdef ESP_PLATFORM
+
+/* ATOM S3R: UART1, TX G38 to the adapter's H2 TXD, RX G39 from its RXD (jumper in A) */
+#define BUS_UART UART_NUM_1
+#define BUS_TX   38
+#define BUS_RX   39
+
+static void open_port(const char *dev, int baud)
+{
+    (void)dev;
+    uart_config_t c = {
+        .baud_rate = baud, .data_bits = UART_DATA_8_BITS, .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1, .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, .source_clk = UART_SCLK_DEFAULT,
+    };
+    if (uart_driver_install(BUS_UART, 1024, 0, 0, NULL, 0) != ESP_OK || uart_param_config(BUS_UART, &c) != ESP_OK ||
+        uart_set_pin(BUS_UART, BUS_TX, BUS_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE) != ESP_OK)
+        die("uart setup failed");
+    gpio_set_pull_mode(BUS_RX, GPIO_PULLUP_ONLY);
+}
+
+static void bus_flush(void) { uart_flush_input(BUS_UART); }
+
+static void bus_write(const unsigned char *b, int n)
+{
+    uart_write_bytes(BUS_UART, b, n);
+    uart_wait_tx_done(BUS_UART, portMAX_DELAY);
+}
+
+/* read n bytes or time out; returns bytes read */
+static int read_bytes(unsigned char *buf, int n, int ms)
+{
+    int r = uart_read_bytes(BUS_UART, buf, n, pdMS_TO_TICKS(ms));
+    return r < 0 ? 0 : r;
+}
+
+/*
+ * The console is the ATOM's USB (USB-Serial/JTAG). It has no termios and no
+ * SIGINT, so it is always "raw", and ctrl-c arrives as a byte (walk checks).
+ */
+static int con_block = 1;
+
+static void con_init(void)
+{
+    usb_serial_jtag_driver_config_t c = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    usb_serial_jtag_driver_install(&c);
+    usb_serial_jtag_vfs_use_driver();
+}
+
+static int con_tty(void) { return 1; }
+static void con_raw(int block) { con_block = block; }
+static void con_restore(void) { con_block = 1; }
+
+/* next byte; with con_raw(0), -1 if there isn't one */
+static int con_getc(void)
+{
+    unsigned char c;
+    return usb_serial_jtag_read_bytes(&c, 1, con_block ? portMAX_DELAY : 0) == 1 ? c : -1;
+}
+
+/* drop typed-ahead input */
+static void con_drop(void)
+{
+    unsigned char c;
+    while (usb_serial_jtag_read_bytes(&c, 1, 0) == 1) ;
+}
+
+static volatile int halted;
+static void sigint_catch(void) {}
+static void sigint_restore(void) {}
+
+static void msleep(int ms) { vTaskDelay(pdMS_TO_TICKS(ms)); }
+
+/* fixed-rate ticks for walk: tick_start, then tick_wait(ms) each tick; tick_start again to resync */
+static TickType_t tick_last;
+static void tick_start(void) { tick_last = xTaskGetTickCount(); }
+static void tick_wait(int ms) { xTaskDelayUntil(&tick_last, pdMS_TO_TICKS(ms)); }
+
+#else
+
+static int fd = -1;
 
 static speed_t baud_const(int baud)
 {
@@ -95,11 +194,12 @@ static void open_port(const char *dev, int baud)
     tcflush(fd, TCIOFLUSH);
 }
 
-static void hexdump(const char *tag, const unsigned char *b, int n)
+static void bus_flush(void) { tcflush(fd, TCIFLUSH); }
+
+static void bus_write(const unsigned char *b, int n)
 {
-    printf("%s", tag);
-    for (int i = 0; i < n; i++) printf(" %02X", b[i]);
-    printf("\n");
+    if (write(fd, b, n) != n) die("write: %s", strerror(errno));
+    tcdrain(fd);
 }
 
 /* read exactly n bytes or time out; returns bytes read */
@@ -118,6 +218,71 @@ static int read_bytes(unsigned char *buf, int n, int ms)
     return got;
 }
 
+/* the console is stdin/stdout; raw = no line buffering or echo, ctrl-c still a signal */
+static struct termios con_old;
+
+static void con_init(void) {}
+static int con_tty(void) { return isatty(0); }
+
+/* block: con_getc waits for a key (else returns -1 if there isn't one) */
+static void con_raw(int block)
+{
+    struct termios raw;
+    tcgetattr(0, &con_old);
+    raw = con_old;
+    raw.c_lflag &= ~(ICANON | ECHO);
+    raw.c_cc[VMIN] = block; raw.c_cc[VTIME] = 0;
+    tcsetattr(0, TCSANOW, &raw);
+}
+
+static void con_restore(void) { tcsetattr(0, TCSANOW, &con_old); }
+
+static int con_getc(void)
+{
+    unsigned char c;
+    return read(0, &c, 1) == 1 ? c : -1;
+}
+
+static void con_drop(void) { tcflush(0, TCIFLUSH); }
+
+static volatile sig_atomic_t halted;
+static void on_sigint(int sig) { (void)sig; halted = 1; }
+static struct sigaction oldsa;
+
+static void sigint_catch(void)
+{
+    struct sigaction sa = { .sa_handler = on_sigint, .sa_flags = SA_RESTART };
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, &oldsa);
+}
+
+static void sigint_restore(void) { sigaction(SIGINT, &oldsa, NULL); }
+
+static void msleep(int ms)
+{
+    struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
+}
+
+static struct timespec tick_next;
+static void tick_start(void) { clock_gettime(CLOCK_MONOTONIC, &tick_next); }
+
+static void tick_wait(int ms)
+{
+    tick_next.tv_nsec += ms * 1000000L;
+    if (tick_next.tv_nsec >= 1000000000L) { tick_next.tv_nsec -= 1000000000L; tick_next.tv_sec++; }
+    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &tick_next, NULL);
+}
+
+#endif
+
+static void hexdump(const char *tag, const unsigned char *b, int n)
+{
+    printf("%s", tag);
+    for (int i = 0; i < n; i++) printf(" %02X", b[i]);
+    printf("\n");
+}
+
 /*
  * Send instruction packet, receive status packet.
  * Returns number of params in reply (>=0), -1 on timeout/no reply,
@@ -134,9 +299,8 @@ static int txrx(int id, int instr, const unsigned char *p, int np,
     for (int i = 0; i < np; i++) { tx[n++] = p[i]; sum += p[i]; }
     tx[n++] = ~sum & 0xFF;
 
-    tcflush(fd, TCIFLUSH);
-    if (write(fd, tx, n) != n) die("write: %s", strerror(errno));
-    tcdrain(fd);
+    bus_flush();
+    bus_write(tx, n);
     if (verbose) hexdump("  tx:", tx, n);
     if (id == BROADCAST && instr != INST_PING) return 0;   /* no reply, don't wait for one */
 
@@ -501,12 +665,6 @@ static const struct param { const char *name; int *v, min, max; const char *what
     { "height", &height,  -SPLAY_MAX, DOWN_MAX, "legs this far below centre when standing, steps: > 0 raises the body, < 0 lowers it, legs splayed" },
 };
 
-static void msleep(int ms)
-{
-    struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
-    nanosleep(&ts, NULL);
-}
-
 static double now(void)
 {
     struct timespec ts;
@@ -690,9 +848,6 @@ static void ident(const int *ids, int nid)
     }
 }
 
-static volatile sig_atomic_t halted;
-static void on_sigint(int sig) { (void)sig; halted = 1; }
-
 /*
  * Walk with the current gait. On the ground a leg's hip sweeps back at 2 amp per
  * stance time, the same rate for every foot down, so none slip. In its swing the
@@ -703,7 +858,8 @@ static void on_sigint(int sig) { (void)sig; halted = 1; }
  * cycle (so the legs that step last aren't dragged too far back) and falls over
  * one step at the end, after which each leg not already within 3 steps of
  * centre takes one more step, to centre.
- * A key (tty) or `cycles` cycles starts the stop; ctrl-c freezes where it is.
+ * A key (tty) or `cycles` cycles starts the stop; ctrl-c freezes where it is
+ * (SIGINT on the Pi, a byte on the ATOM).
  * Each tick also reads one servo's load, round robin, for a peak load report;
  * the reads note any status errors (overload), which print after the command.
  */
@@ -722,19 +878,9 @@ static void walk(int cycles, int str, int turn)
         state[i] = u > 0 && u < g->swing ? 2 : 0;
     }
 
-    int tty = isatty(0);
-    struct termios old, raw;
-    if (tty) {
-        tcgetattr(0, &old);
-        raw = old;
-        raw.c_lflag &= ~(ICANON | ECHO);
-        raw.c_cc[VMIN] = 0; raw.c_cc[VTIME] = 0;
-        tcsetattr(0, TCSANOW, &raw);
-        tcflush(0, TCIFLUSH);
-    }
-    struct sigaction sa = { .sa_handler = on_sigint, .sa_flags = SA_RESTART }, oldsa;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGINT, &sa, &oldsa);
+    int tty = con_tty();
+    if (tty) { con_raw(0); con_drop(); }
+    sigint_catch();
     halted = 0;
 
     printf("walking: %s, %.1f s cycle, stride %d, turn %d, lift %d; %sctrl-c freezes\n",
@@ -742,20 +888,18 @@ static void walk(int cycles, int str, int turn)
     fflush(stdout);
     double phase = 0, r = 0, t = now();
     int stopping = 0;
-    struct timespec next;
-    clock_gettime(CLOCK_MONOTONIC, &next);
+    tick_start();
     while (nsettled < 6) {
-        next.tv_nsec += TICK_MS * 1000000L;
-        if (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
-        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
+        tick_wait(TICK_MS);
+        int c = tty ? con_getc() : -1;
+        if (c == 3) halted = 1;                 /* ctrl-c as a byte (the ATOM's console has no SIGINT) */
         if (halted) break;
         double t1 = now(), dt = t1 - t;
         t = t1;
         if (dt > 0.1) dt = 0.1;                 /* a stall: slow the gait, don't jump it */
-        if (dt > 2 * TICK_MS / 1000.0) clock_gettime(CLOCK_MONOTONIC, &next);   /* fell behind: don't burst to catch up */
+        if (dt > 2 * TICK_MS / 1000.0) tick_start();    /* fell behind: don't burst to catch up */
 
-        unsigned char c;
-        if (!stopping && ((tty && read(0, &c, 1) == 1) || (cycles && phase >= cycles))) {
+        if (!stopping && (c >= 0 || (cycles && phase >= cycles))) {
             stopping = 1;
             puts("stopping");
             fflush(stdout);
@@ -791,8 +935,8 @@ static void walk(int cycles, int str, int turn)
         tick++;
     }
 
-    sigaction(SIGINT, &oldsa, NULL);
-    if (tty) { tcflush(0, TCIFLUSH); tcsetattr(0, TCSANOW, &old); }   /* drop extra keys, not into the next line */
+    sigint_restore();
+    if (tty) { con_drop(); con_restore(); }    /* drop extra keys, not into the next line */
     if (halted) puts("\nhalted, holding this pose (stand puts all feet down)");
     else {
         for (int i = 0; i < 6; i++) legs[i].x = legs[i].z = 0;    /* tidy the last fraction of a step */
@@ -1000,9 +1144,8 @@ static int run(char **tok, int nt)
     else if (!strcmp(c, "raw")) {
         unsigned char b[64]; int n = 0;
         for (int i = 1; i < nt && n < 64; i++) b[n++] = strtol(tok[i], NULL, 16);
-        tcflush(fd, TCIFLUSH);
-        if (write(fd, b, n) != n) perror("write");
-        tcdrain(fd);
+        bus_flush();
+        bus_write(b, n);
         hexdump("tx:", b, n);
         unsigned char r[64]; int got = read_bytes(r, sizeof r, timeout_ms);
         hexdump("rx:", r, got);
@@ -1062,20 +1205,18 @@ static void load(char *buf, int size, const char *s, int *len, int *cur)
 /* returns 0 on EOF (ctrl-d on an empty line) */
 static int edit_line(char *buf, int size)
 {
-    struct termios old, raw;
-    tcgetattr(0, &old);
-    raw = old;
-    raw.c_lflag &= ~(ICANON | ECHO);
-    raw.c_cc[VMIN] = 1; raw.c_cc[VTIME] = 0;
-    tcsetattr(0, TCSANOW, &raw);
+    static int prev;        /* a terminal may send CR LF for enter (idf.py monitor does): one line, not two */
+    con_raw(1);
 
     char draft[1024] = "";  /* the line being typed, kept while browsing history */
     int len = 0, cur = 0, h = nhist, ok = 1;
     buf[0] = 0;
     redraw(buf, len, cur);
     for (;;) {
-        unsigned char c;
-        if (read(0, &c, 1) != 1) { ok = 0; break; }
+        int c = con_getc(), lf = c == '\n' && prev == '\r';
+        prev = c;
+        if (c < 0) { ok = 0; break; }
+        if (lf) continue;
         if (c == '\r' || c == '\n') break;
         if (c == 4 && !len) { ok = 0; break; }                     /* ctrl-d */
         if (c == 127 || c == 8) {                                  /* backspace */
@@ -1084,12 +1225,11 @@ static int edit_line(char *buf, int size)
         else if (c == 5) cur = len;                                /* ctrl-e */
         else if (c == 21) len = cur = 0;                           /* ctrl-u */
         else if (c == 27) {                                        /* escape sequence */
-            unsigned char e[2];
-            if (read(0, e, 1) != 1 || (e[0] != '[' && e[0] != 'O') || read(0, e + 1, 1) != 1) continue;
-            char k = e[1];
+            int e = con_getc();
+            if (e != '[' && e != 'O') continue;
+            int k = con_getc();
             if (k >= '0' && k <= '9') {                            /* ESC [ n ~ */
-                unsigned char t;
-                if (read(0, &t, 1) != 1 || t != '~') continue;
+                if (con_getc() != '~') continue;
                 k = (k == '1' || k == '7') ? 'H' : (k == '4' || k == '8') ? 'F' : (k == '3') ? 'X' : 0;
             }
             if (k == 'A' || k == 'B') {                            /* up / down: history */
@@ -1112,7 +1252,7 @@ static int edit_line(char *buf, int size)
     }
     buf[len] = 0;
     putchar('\n');
-    tcsetattr(0, TCSANOW, &old);
+    con_restore();
 
     if (ok && len && (!nhist || strcmp(hist[nhist - 1], buf))) {
         if (nhist == NHIST) { free(hist[0]); memmove(hist, hist + 1, (NHIST - 1) * sizeof *hist); nhist--; }
@@ -1121,15 +1261,11 @@ static int edit_line(char *buf, int size)
     return ok;
 }
 
-int main(int argc, char **argv)
+/* read and run lines until quit or EOF */
+static void repl(void)
 {
-    const char *dev = argc > 1 ? argv[1] : "/dev/ttyACM0";
-    int baud = argc > 2 ? atoi(argv[2]) : 1000000;
-    open_port(dev, baud);
-    printf("opened %s @ %d (type help)\n", dev, baud);
-
     char line[1024];
-    int interactive = isatty(0), done = 0;
+    int interactive = con_tty(), done = 0;
     while (!done) {
         if (interactive ? !edit_line(line, sizeof line) : !fgets(line, sizeof line, stdin)) break;
         /* ';' separates commands on one line; run them in order */
@@ -1140,6 +1276,29 @@ int main(int argc, char **argv)
             if (nt) done = dispatch(tok, nt);
         }
     }
+}
+
+#ifdef ESP_PLATFORM
+void app_main(void)
+{
+    con_init();
+    open_port(NULL, 1000000);
+    for (;;) {
+        printf("hector on the ATOM: bus on UART1 (TX G38, RX G39) @ 1000000 (type help)\n");
+        repl();
+        puts("nothing to quit to on the ATOM");
+    }
+}
+#else
+int main(int argc, char **argv)
+{
+    const char *dev = argc > 1 ? argv[1] : "/dev/ttyACM0";
+    int baud = argc > 2 ? atoi(argv[2]) : 1000000;
+    con_init();
+    open_port(dev, baud);
+    printf("opened %s @ %d (type help)\n", dev, baud);
+    repl();
     close(fd);
     return 0;
 }
+#endif

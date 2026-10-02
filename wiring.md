@@ -37,7 +37,7 @@ In code: `Serial1.begin(1000000, SERIAL_8N1, 39, 38);` (rx, tx).
 
 1. Before connecting the ATOM: battery on, check U1 + D1 give about 4.7 V, positive on the D1 cathode side. U1 has no reverse-polarity protection (the adapter does).
 2. Connect the ATOM. It should boot from the battery, with or without USB.
-3. Jumper to A, then flash something that pings id 1 at 1 Mbps on Serial1.
+3. Jumper to A, then flash `atom/` (see the README) and `ping` (2026-10-02: all 12 servos replied, with USB powering the ATOM and the buck's 5V lead off while D1 is on order).
 4. Back to the Pi: jumper to B. The ATOM can stay wired.
 
 ### Sources

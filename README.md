@@ -32,7 +32,7 @@ The same `hector.c` also builds for the ATOM S3R (ESP-IDF, in `atom/`), which dr
 
 ```
 cd atom
-. ~/esp/esp-idf/export.sh
+source ~/esp/esp-idf/export.sh
 idf.py build
 idf.py -p /dev/serial/by-id/usb-Espressif_* flash monitor     # ctrl-] leaves the monitor
 ```

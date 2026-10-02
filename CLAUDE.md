@@ -25,7 +25,7 @@ make                               # cc -O2 -Wall -Wextra -o hector hector.c -lm
 ./hector [/dev/ttyACM0] [baud]     # defaults: /dev/ttyACM0, 1000000
 echo "walk 2" | ./hector           # non-tty stdin works for scripted commands
 
-cd atom && . ~/esp/esp-idf/export.sh   # the ATOM build (ESP-IDF v6.x at ~/esp/esp-idf)
+cd atom && source ~/esp/esp-idf/export.sh   # the ATOM build (ESP-IDF v6.x at ~/esp/esp-idf)
 idf.py build && idf.py -p /dev/serial/by-id/usb-Espressif_* flash
 ```
 

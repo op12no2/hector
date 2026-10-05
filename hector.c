@@ -1126,7 +1126,7 @@ static int check_servos(void)
  * The self test, at startup and by the selftest command. It only reads, so
  * nothing moves. Two halves: t_pre(), before standing, is the go/no-go for
  * standing up (the servos, battery, temperatures, error bits, overload
- * settings, positions); t_standing() needs the weight on the feet (the load
+ * settings, gains, positions); t_standing() needs the weight on the feet (the load
  * on each foot, sag, level, the highest load, the battery under load). Each
  * check logs a line on the console and a short one (10 characters) on the
  * ATOM's screen as it goes; t_end() then says Hi! on the screen, in green,
@@ -1135,12 +1135,17 @@ static int check_servos(void)
  */
 #define REG_UNLOAD        0x13  /* unloading conditions: bit 5 = overload protection */
 #define REG_PROT_TORQUE   0x25  /* then 0x26 protection time (40 ms units), 0x27 overload torque (%) */
+#define REG_P_GAIN        0x15  /* then 0x16 D, 0x17 I (EPROM) */
+#define P_GAIN 15
+#define D_GAIN 15
+#define I_HIP  0
+#define I_LIFT 1                /* so a lift pushes its foot right onto its goal, and its load is the force on it */
 #define BATT_LOW  70            /* 2S, 0.1 V */
 #define BATT_FLAT 66
 #define BATT_HIGH 87            /* a full 2S reads up to 8.6 on some servos */
-#define FEET_SPREAD 80          /* 0.1%: a lift's load this far from the mean is uneven. Loads read
-                                   0 (dead zone), 6, 7.5, 9... one value per step a foot is pushed
-                                   up, so standing on 1-3 steps they can't be evened out finer */
+#define FEET_SPREAD 30          /* 0.1%: a lift's load this far from the mean is uneven (with the lifts'
+                                   I = 1 they stand within about 1.5%; with I = 0 loads only read 0, 6,
+                                   7.5... one value per step a foot is pushed up, and can't be evened) */
 #define SAG_MAX   6             /* steps a foot may be pushed up from its goal standing (2-4 is usual) */
 #define LEVEL_MAX 5.0           /* deg of tilt standing */
 
@@ -1280,6 +1285,26 @@ static int t_pre(void)
     }
     else t_line(T_OK, "prot ok", "overload protection at the defaults (over 80%% for 4 s drops to 20%%)");
 
+    /* the gains: P, D and I as set (I = 1 on the lifts; a new servo comes with 0) */
+    int gain[12] = {0}, ngain = 0;
+    for (int i = 0; i < 12; i++) {
+        int id = i < 6 ? legs[i].hip : legs[i - 6].lift, want = i < 6 ? I_HIP : I_LIFT;
+        unsigned char p[3], e;
+        if (miss[i]) continue;
+        if (txrx(id, INST_READ, (unsigned char[]){ REG_P_GAIN, 3 }, 2, &e, p, 3) != 3) { gain[i] = 1; ngain++; continue; }
+        if (p[0] != P_GAIN || p[1] != D_GAIN || p[2] != want) {
+            printf("      servo %d: P %d D %d I %d, not %d %d %d (lock %d 0; wb %d 0x17 %d; lock %d 1)\n",
+                   id, p[0], p[1], p[2], P_GAIN, D_GAIN, want, id, id, want, id);
+            gain[i] = 1;
+            ngain++;
+        }
+    }
+    if (ngain) {
+        snprintf(s, sizeof s, "gain %s", t_ids(gain));
+        t_line(T_WARN, s, "gains not as set (or unreadable) on servo(s) %s", t_ids(gain));
+    }
+    else t_line(T_OK, "gains ok", "gains as set: P %d, D %d, I %d on the hips and %d on the lifts", P_GAIN, D_GAIN, I_HIP, I_LIFT);
+
     /* positions: inside the range the legs are driven over */
     int far[12] = {0}, nfar = 0;
     for (int i = 0; i < 12; i++) {
@@ -1311,6 +1336,7 @@ static void t_standing(void)
     int sag[6], vmin = 255, lmax = 0, lmax_id = 0, bad = 0;
     char s[64];
     for (int i = 0; i < 6; i++) sag[i] = -1000;
+    msleep(1000);                       /* the lifts' I term takes a moment to take up the weight */
     for (int k = 0; k < 5 && !bad; k++) {
         for (int i = 0; i < 12; i++) {
             const struct leg *L = &legs[i % 6];

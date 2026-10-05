@@ -1124,16 +1124,23 @@ static int check_servos(void)
 
 /*
  * The self test, at startup and by the selftest command. It only reads, so
- * nothing moves. Each check logs a line on the console and a short one (10
- * characters) on the ATOM's screen as it goes; then the screen says Hi!, in
- * green, yellow if there were warnings, red if anything failed, with the
- * problems under it.
+ * nothing moves. Two halves: t_pre(), before standing, is the go/no-go for
+ * standing up (the servos, battery, temperatures, error bits, overload
+ * settings, positions); t_standing() needs the weight on the feet (the load
+ * on each foot, sag, level, the highest load, the battery under load). Each
+ * check logs a line on the console and a short one (10 characters) on the
+ * ATOM's screen as it goes; t_end() then says Hi! on the screen, in green,
+ * yellow if there were warnings, red if anything failed, with the problems
+ * under it.
  */
 #define REG_UNLOAD        0x13  /* unloading conditions: bit 5 = overload protection */
 #define REG_PROT_TORQUE   0x25  /* then 0x26 protection time (40 ms units), 0x27 overload torque (%) */
 #define BATT_LOW  70            /* 2S, 0.1 V */
 #define BATT_FLAT 66
 #define BATT_HIGH 87            /* a full 2S reads up to 8.6 on some servos */
+#define FEET_SPREAD 30          /* 0.1%: a lift's load this far from the mean is uneven */
+#define SAG_MAX   6             /* steps a foot may be pushed up from its goal standing (2-4 is usual) */
+#define LEVEL_MAX 5.0           /* deg of tilt standing */
 
 enum { T_OK, T_WARN, T_FAIL };
 static const int t_colour[] = { 0x07E0, 0xFFE0, 0xF800 };     /* RGB565 green, yellow, red */
@@ -1144,6 +1151,7 @@ static int t_nlog, t_nbad, t_worst;
 static const char *scr_what;                                  /* from scr_init(); NULL with no screen */
 static int scr_ok;
 static int imu_st;                                            /* from imu_init() */
+static int standing;                                          /* stand ran last (not sit, or a frozen walk) */
 
 static void t_draw(const struct t_line *l, int n, int y)
 {
@@ -1181,7 +1189,8 @@ static const char *t_ids(const int *bad)
     return s;
 }
 
-static int selftest(void)
+/* the checks before standing; the worst result so far */
+static int t_pre(void)
 {
     int volt[12], temp[12], pos[12], miss[12] = {0}, nmiss = 0;
     unsigned char err[12] = {0};
@@ -1193,13 +1202,7 @@ static int selftest(void)
     if (imu_st <= 0) {
         double a[3], g[3];
         if (imu_st < 0 || imu_read(a, g)) t_line(T_FAIL, "no imu", "IMU (BMI270) didn't answer or start");
-        else {
-            double pitch = atan2(a[0], a[2]) * 180 / M_PI, roll = atan2(a[1], a[2]) * 180 / M_PI;
-            char s[16];
-            snprintf(s, sizeof s, "tilt %.1f", hypot(pitch, roll));
-            t_line(T_OK, s, "IMU: pitch %.1f deg (+ = nose up), roll %.1f deg (+ = left side up), rotation %.1f %.1f %.1f deg/s",
-                   pitch, roll, g[0], g[1], g[2]);
-        }
+        else t_line(T_OK, "imu ok", "IMU answers: gravity %.2f %.2f %.2f g", a[0], a[1], a[2]);
     }
 
     /* every servo replies (quietly: a missing battery would print 12 "no reply"s) */
@@ -1213,7 +1216,7 @@ static int selftest(void)
     }
     if (nmiss == 12) {
         t_line(T_FAIL, "no servos", "no servo replied: battery off, or the bus not connected?");
-        goto done;
+        return t_worst;
     }
     if (nmiss) {
         char s[64];
@@ -1276,7 +1279,7 @@ static int selftest(void)
     else t_line(T_OK, "prot ok", "overload protection at the defaults (over 80%% for 4 s drops to 20%%)");
 
     /* positions: inside the range the legs are driven over */
-    int far[12] = {0}, nfar = 0, lmax = 0;
+    int far[12] = {0}, nfar = 0;
     for (int i = 0; i < 12; i++) {
         const struct leg *L = &legs[i % 6];
         int id = i < 6 ? L->hip : L->lift;
@@ -1285,8 +1288,6 @@ static int selftest(void)
         if (txrx(id, INST_READ, (unsigned char[]){ REG_PRESENT_POS, 2 }, 2, &e, b, 2) != 2) { far[i] = 1; nfar++; continue; }
         pos[i] = get16(b) - CENTRE - offset[id];
         if (i < 6 ? abs(pos[i]) > HIP_MAX + 10 : L->lift_dir * pos[i] < -DOWN_MAX - 10) { far[i] = 1; nfar++; }
-        if (txrx(id, INST_READ, (unsigned char[]){ REG_PRESENT_LOAD, 2 }, 2, &e, b, 2) == 2 && (get16(b) & 0x3FF) > lmax)
-            lmax = get16(b) & 0x3FF;
     }
     if (nfar) {
         snprintf(s, sizeof s, "pos %s", t_ids(far));
@@ -1294,12 +1295,83 @@ static int selftest(void)
                t_ids(far), HIP_MAX, DOWN_MAX);
     }
     else t_line(T_OK, "pos ok", "every servo inside the range the legs are driven over");
+    return t_worst;
+}
 
-    /* standing still is when overload protection bites */
+/*
+ * The checks standing: the load on each foot (as calibrate measures it, 5
+ * reads each), sag (each lift's position against its goal), level (IMU), the
+ * highest load on any servo, and the battery under load.
+ */
+static void t_standing(void)
+{
+    double ld[6] = {0}, mean = 0, spread = 0;
+    int sag[6], vmin = 255, lmax = 0, lmax_id = 0, bad = 0;
+    char s[64];
+    for (int i = 0; i < 6; i++) sag[i] = -1000;
+    for (int k = 0; k < 5 && !bad; k++) {
+        for (int i = 0; i < 12; i++) {
+            const struct leg *L = &legs[i % 6];
+            int id = i < 6 ? L->hip : L->lift;
+            unsigned char b[22], e;
+            /* goal 0x2A, present position 0x38, load 0x3C, voltage 0x3E */
+            if (txrx(id, INST_READ, (unsigned char[]){ REG_GOAL_POS, 21 }, 2, &e, b, 21) != 21) { bad = id; break; }
+            int goal = get16(b), pos = get16(b + REG_PRESENT_POS - REG_GOAL_POS);
+            int v = get16(b + REG_PRESENT_LOAD - REG_GOAL_POS), load = v & 0x400 ? -(v & 0x3FF) : v & 0x3FF;
+            int volt = b[REG_VOLTAGE - REG_GOAL_POS];
+            if (abs(load) > lmax) { lmax = abs(load); lmax_id = id; }
+            if (volt < vmin) vmin = volt;
+            if (i >= 6) {
+                ld[i - 6] += L->lift_dir * load / 5.0;                  /* + = foot pushing down */
+                int d = L->lift_dir * (pos - goal);                      /* + = foot pushed up from its goal: sag */
+                if (d > sag[i - 6]) sag[i - 6] = d;
+            }
+        }
+        msleep(40);
+    }
+    if (bad) { snprintf(s, sizeof s, "no %d", bad); t_line(T_FAIL, s, "servo %d didn't reply", bad); return; }
+
+    for (int i = 0; i < 6; i++) mean += ld[i] / 6;
+    for (int i = 0; i < 6; i++) if (fabs(ld[i] - mean) > spread) spread = fabs(ld[i] - mean);
+    printf("      lift loads:");
+    for (int i = 0; i < 6; i++) printf(" %d:%.1f", legs[i].lift, ld[i] / 10);
+    printf(" %%\n");
+    if (mean < 20) t_line(T_WARN, "feet light", "the feet carry hardly any load (mean %.1f%%): held up?", mean / 10);
+    else {
+        snprintf(s, sizeof s, "feet %.1f%%", spread / 10);
+        t_line(spread > FEET_SPREAD ? T_WARN : T_OK, s, "load on the feet %.1f%% each on average, the most uneven %.1f%% off%s",
+               mean / 10, spread / 10, spread > FEET_SPREAD ? ": calibrate" : "");
+    }
+
+    int smax = 0, sid = 0;
+    for (int i = 0; i < 6; i++) if (sag[i] > smax) { smax = sag[i]; sid = legs[i].lift; }
+    snprintf(s, sizeof s, "sag %d", smax);
+    t_line(smax > SAG_MAX ? T_WARN : T_OK, s, "most sag %d steps (lift %d)%s", smax, sid,
+           smax > SAG_MAX ? ": a weak servo or a slipped horn?" : "");
+
+    if (imu_st == 0) {
+        double a[3], g[3];
+        if (imu_read(a, g)) t_line(T_FAIL, "no imu", "IMU read failed");
+        else {
+            double pitch = atan2(a[0], a[2]) * 180 / M_PI, roll = atan2(a[1], a[2]) * 180 / M_PI, tilt = hypot(pitch, roll);
+            snprintf(s, sizeof s, "level %.1f", tilt);
+            t_line(tilt > LEVEL_MAX ? T_WARN : T_OK, s, "standing %.1f deg off level (%.1f towards the 1-2 gap, %.1f to its left)%s",
+                   tilt, pitch, roll, tilt > LEVEL_MAX ? ": a leg down, or not on the flat?" : "");
+        }
+    }
+
     snprintf(s, sizeof s, "load %d%%", lmax / 10);
-    t_line(lmax >= 800 ? T_FAIL : lmax >= 500 ? T_WARN : T_OK, s, "highest load %.1f%% (overload protection starts at 80%% held for 4 s)", lmax / 10.0);
+    t_line(lmax >= 800 ? T_FAIL : lmax >= 500 ? T_WARN : T_OK, s,
+           "highest load %.1f%% (servo %d; overload protection starts at 80%% held for 4 s)", lmax / 10.0, lmax_id);
 
-done:
+    snprintf(s, sizeof s, "batt %.1fV", vmin / 10.0);
+    t_line(vmin < BATT_FLAT ? T_FAIL : vmin < BATT_LOW ? T_WARN : T_OK, s, "battery %.1f V standing%s", vmin / 10.0,
+           vmin < BATT_FLAT ? ": flat, charge it" : vmin < BATT_LOW ? ": low" : "");
+}
+
+/* the result: a line on the console, and Hi! on the screen */
+static int t_end(void)
+{
     printf("self test: %s\n", t_worst == T_OK ? "all ok" : t_worst == T_WARN ? "warnings" : "problems");
     if (scr_what) {
         msleep(1000);
@@ -1310,6 +1382,29 @@ done:
         scr_show();
     }
     return t_worst;
+}
+
+static int stand(int ms);
+
+/* at power-on: the checks, then (unless something failed) stand, and the standing checks */
+static void t_boot(int stand_up)
+{
+    if (t_pre() != T_FAIL && stand_up) {
+        t_line(T_OK, "standing", "standing up");
+        if (stand(1000)) t_line(T_FAIL, "no stand", "stand failed");
+        else t_standing();
+    }
+    t_end();
+}
+
+/* the selftest command: the standing checks too if it's standing */
+static void selftest(void)
+{
+    if (t_pre() != T_FAIL) {
+        if (standing) t_standing();
+        else puts("      (not standing: the standing checks need stand first)");
+    }
+    t_end();
 }
 
 /*
@@ -1439,8 +1534,6 @@ static void bow_screen(const char *s, int colour)
     scr_show();
 }
 
-static int stand(int ms);
-
 static void bow(int secs)
 {
     double a0[3], a[3], g[3];
@@ -1508,6 +1601,7 @@ static int stand(int ms)
     for (int i = 0; i < 6; i++) legs[i].x = legs[i].z = 0;
     send_pose(ms);
     msleep(ms + 200);
+    standing = 1;
     return 0;
 }
 
@@ -1533,6 +1627,7 @@ static void sit(int ms)
     }
     sync_move(ids, 6, pos, ms, 0);
     msleep(ms + 200);
+    standing = 0;
 }
 
 /*
@@ -1735,7 +1830,7 @@ static void walk(int cycles, int str, int turn)
 
     sigint_restore();
     if (tty) { con_drop(); con_restore(); }    /* drop extra keys, not into the next line */
-    if (halted) puts("\nhalted, holding this pose (stand puts all feet down)");
+    if (halted) { puts("\nhalted, holding this pose (stand puts all feet down)"); standing = 0; }
     else {
         for (int i = 0; i < 6; i++) legs[i].x = legs[i].z = 0;    /* tidy the last fraction of a step */
         send_pose(200);
@@ -2089,7 +2184,7 @@ void app_main(void)
     scr_what = scr_init(&scr_ok);
     imu_st = imu_init();
     printf("hector on the ATOM: bus on UART1 (TX G38, RX G39) @ 1000000\n");
-    if (selftest() != T_FAIL) stand(1000);      /* power on = stand up, unless something failed */
+    t_boot(1);                                  /* power on = checks, stand up unless something failed, more checks */
     for (;;) {
         printf("type help\n");
         repl();
@@ -2106,7 +2201,7 @@ int main(int argc, char **argv)
     printf("opened %s @ %d\n", dev, baud);
     scr_what = scr_init(&scr_ok);
     imu_st = imu_init();
-    selftest();
+    t_boot(0);
     printf("type help\n");
     repl();
     close(fd);

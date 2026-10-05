@@ -1208,6 +1208,7 @@ static const char *scr_what;                                  /* from scr_init()
 static int scr_ok;
 static int imu_st;                                            /* from imu_init() */
 static int standing;                                          /* stand ran last (not sit, or a frozen walk) */
+static int limp;                                              /* an all stop went limp: the face shows it until stand */
 static double t_shown;                                        /* the eyes show the self test's result until then */
 
 static void t_draw(const struct t_line *l, int n, int y)
@@ -1616,6 +1617,11 @@ static double leg_ang(int k) { return (30 - 60 * (k - 1)) * M_PI / 180; }
 static int stand(int ms)
 {
     if (check_servos()) return -1;
+    limp = 0;
+    for (int i = 0; i < 6; i++) {                       /* torque on: an all stop leaves it off */
+        write_u8(legs[i].hip, REG_TORQUE_ENABLE, 1);
+        write_u8(legs[i].lift, REG_TORQUE_ENABLE, 1);
+    }
     for (int i = 0; i < 6; i++) legs[i].x = legs[i].z = 0;
     send_pose(ms);
     msleep(ms + 200);
@@ -1774,6 +1780,33 @@ static void ident(const int *ids, int nid)
  * Each tick also reads one servo's load, round robin, for a peak load report;
  * the reads note any status errors (overload), which print after the command.
  */
+/*
+ * All stop: while walking, a servo's load over STOP_LOAD (a leg pushing on
+ * something: walking peaks have been about 30%), no lift over LIFTED_LOAD for
+ * a whole round of reads (picked up: on the ground, a walk's stance legs carry
+ * 15-30%), or the body rotating faster than STOP_GYRO or jolted by more than
+ * STOP_JOLT (knocked or grabbed: a tripod walk itself reaches about 40 deg/s
+ * and 0.3 g), and it goes limp, torque off on all twelve, so nothing stays
+ * pressed on a hand. The body settles onto its base (it's made to); the face
+ * says so (limp) until stand gets it up again.
+ */
+#define STOP_LOAD   500         /* 0.1% */
+#define LIFTED_LOAD 30
+#define STOP_GYRO   120.0       /* deg/s */
+#define STOP_JOLT   1.0         /* g from 1 */
+
+static void go_limp(const char *why)
+{
+    limp = 1;
+    for (int i = 0; i < 6; i++) {
+        write_u8(legs[i].hip, REG_TORQUE_ENABLE, 0);
+        write_u8(legs[i].lift, REG_TORQUE_ENABLE, 0);
+    }
+    standing = 0;
+    printf("\nall stop: %s; limp (stand gets up again)\n", why);
+    fflush(stdout);
+}
+
 static void walk(int cycles, int str, int turn)
 {
     const struct gait *g = &gaits[gait];
@@ -1797,8 +1830,10 @@ static void walk(int cycles, int str, int turn)
     printf("walking: %s, %.1f s cycle, stride %d, turn %d, lift %d; %sctrl-c freezes\n",
            g->name, period, str, turn, lift, tty ? "any key stops, " : "");
     fflush(stdout);
-    double phase = 0, r = 0, t = now();
+    double phase = 0, r = 0, t = now(), gmax = 0, jmax = 0;
+    int lift_max = 0, lifted_ok = 0;    /* the most load on any lift this round of 12 reads, and since the walk began */
     int stopping = 0;
+    char stop_why[64] = "";
     tick_start();
     while (nsettled < 6) {
         tick_wait(TICK_MS);
@@ -1841,14 +1876,31 @@ static void walk(int cycles, int str, int turn)
         send_pose(TICK_MS);
 
         /* one servo's load per tick, for the peak load report */
-        int id = tick % 12 < 6 ? legs[tick % 12].hip : legs[tick % 12 - 6].lift, ld;
+        int id = tick % 12 < 6 ? legs[tick % 12].hip : legs[tick % 12 - 6].lift, ld = 0;
         if (read_u16(id, REG_PRESENT_LOAD, &ld) == 0 && (ld & 0x3FF) > peak[tick % 12]) peak[tick % 12] = ld & 0x3FF;
         tick++;
+        if ((ld & 0x3FF) > STOP_LOAD) snprintf(stop_why, sizeof stop_why, "servo %d at %d%% load", id, (ld & 0x3FF) / 10);
+        if ((tick - 1) % 12 >= 6 && (ld & 0x3FF) > lift_max) lift_max = ld & 0x3FF;     /* that read was a lift */
+        if (tick % 12 == 0) {                   /* a round done: was anything standing on the ground? */
+            if (lift_max > LIFTED_LOAD) lifted_ok = 1;
+            else if (lifted_ok) snprintf(stop_why, sizeof stop_why, "no weight on any foot (picked up?)");
+            lift_max = 0;
+        }
+        double a[3], gy[3];
+        if (imu_st == 0 && imu_read(a, gy) == 0) {
+            double gm = sqrt(gy[0] * gy[0] + gy[1] * gy[1] + gy[2] * gy[2]), jm = fabs(sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]) - 1);
+            if (gm > gmax) gmax = gm;
+            if (jm > jmax) jmax = jm;
+            if (gm > STOP_GYRO) snprintf(stop_why, sizeof stop_why, "turned at %.0f deg/s", gm);
+            if (jm > STOP_JOLT) snprintf(stop_why, sizeof stop_why, "jolted by %.2f g", jm);
+        }
+        if (*stop_why) break;
     }
 
     sigint_restore();
     if (tty) { con_drop(); con_restore(); }    /* drop extra keys, not into the next line */
-    if (halted) { puts("\nhalted, holding this pose (stand puts all feet down)"); standing = 0; }
+    if (*stop_why) go_limp(stop_why);
+    else if (halted) { puts("\nhalted, holding this pose (stand puts all feet down)"); standing = 0; }
     else {
         for (int i = 0; i < 6; i++) legs[i].x = legs[i].z = 0;    /* tidy the last fraction of a step */
         send_pose(200);
@@ -1859,6 +1911,7 @@ static void walk(int cycles, int str, int turn)
     printf("peak load %% (a servo over 80%% for 4 s drops to 20%%):");
     for (int k = 0; k < 12; k++) printf(" %d:%d", k < 6 ? legs[k].hip : legs[k - 6].lift, (peak[k] + 5) / 10);
     putchar('\n');
+    if (imu_st == 0) printf("most rotation %.0f deg/s, most jolt %.2f g (all stop at %.0f, %.2f)\n", gmax, jmax, STOP_GYRO, STOP_JOLT);
 }
 
 /* run one tokenised command; returns 1 on quit */
@@ -2185,10 +2238,11 @@ static void eyes(void)
     double d = remainder(target - beta, 2 * M_PI);
     if (fabs(d) > 0.003) { beta += fabs(d) < 0.02 ? d : d * 0.15; eyes_dirty = 1; }
 
-    /* the status: the self test's for a while after it, then the watch's */
+    /* the status: the self test's for a while after it, then the watch's; limp (all stop) if nothing worse */
     int level = w_level;
     const char *text = w_text;
     if (t < t_shown || !w_swept) { level = t_worst; text = t_nbad ? t_bad[0].s : ""; }
+    if (limp && level < T_WARN) { level = T_WARN; text = "limp"; }
     static int last_level = -1;
     static char last_text[16];
     if (level != last_level || strcmp(text, last_text)) {
@@ -2203,6 +2257,7 @@ static void eyes(void)
     double want = level == T_OK ? 1 : level == T_WARN ? 0 : -1;
     if (fabs(want - mood) > 0.01) { mood += fabs(want - mood) < 0.05 ? want - mood : (want - mood) * 0.1; eyes_dirty = 1; }
 
+    if (limp && open > 0.45) open = 0.45;      /* sleepy until it's stood up */
     int lid = (int)lround((EYE_UP + EYE_DOWN) * (1 - open)), px = (int)lround(cx * LOOK_X), py = (int)lround(cy * LOOK_Y);
     if (!eyes_dirty && lid == last_open && px == last_px && py == last_py) return;
     eyes_dirty = 0; last_open = lid; last_px = px; last_py = py;
@@ -2330,7 +2385,15 @@ static int watch(void)
         snprintf(why, sizeof why, "battery low: %.1f V", vmin / 10.0);
     }
 
-    if (level == w_level && !strcmp(s, w_text)) return 0;
+    /* the problem without the numbers that drift: a voltage or temperature that moves a little isn't a new problem */
+    static char w_key[16];
+    char key[16];
+    snprintf(key, sizeof key, "%s", s);
+    if (!strncmp(key, "batt", 4)) key[4] = 0;                       /* "batt 6.9V" */
+    else if (*key && key[strlen(key) - 1] == 'C' && strchr(key, ' ')) *strchr(key, ' ') = 0;   /* "9 61C": the id */
+    if (strcmp(s, w_text)) { snprintf(w_text, sizeof w_text, "%s", s); eyes_dirty = 1; }  /* the screen keeps up quietly */
+    if (level == w_level && !strcmp(key, w_key)) return 0;
+    snprintf(w_key, sizeof w_key, "%s", key);
     int printed = 1;
     printf("\r\x1b[K");
     if (level) printf("%s %s\n", level == T_FAIL ? "FAIL " : "warn ", why);
@@ -2356,6 +2419,35 @@ static void face_wait(int ms)
     }
 }
 
+/*
+ * Before it moves after a tip or a push: the face turns to the new front (the
+ * cue), and it waits until it has been still, no tilt over HANDS_TILT from
+ * where it was as the wait began (a push may have left it on a slightly
+ * different slope) and no rotation over HANDS_GYRO, for HANDS_OFF_MS.
+ * Touched again in that time, it doesn't move: -1.
+ */
+#define HANDS_OFF_MS 1500
+#define HANDS_TILT   1.5        /* deg */
+#define HANDS_GYRO   4.0        /* deg/s */
+
+static int hands_off(void)
+{
+    double end = now() + HANDS_OFF_MS / 1000.0, a[3], g[3], a0[3];
+    if (bow_level(a0, 100)) return 0;
+    while (now() < end) {
+        if (scr_what) eyes();
+        msleep(ALIVE_MS);
+        if (imu_read(a, g)) continue;
+        double tilt = asin(clampd(hypot(a[0] - a0[0], a[1] - a0[1]), 0, 1)) * 180 / M_PI;
+        if (tilt > HANDS_TILT || sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]) > HANDS_GYRO) {
+            printf("      touched again: not moving\n");
+            fflush(stdout);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 /* bow towards pang (radians, imu_read()'s axes), then stand again */
 static void bow_to(double pang, double peak)
 {
@@ -2369,9 +2461,11 @@ static void bow_to(double pang, double peak)
     printf("\r\x1b[Ktipped %.1f deg towards %.0f deg: bowing on legs %d+%d (lifts %d, %d)\n", peak, pang * 180 / M_PI,
            legs[lo].hip, legs[hi].hip, legs[lo].lift, legs[hi].lift);
     fflush(stdout);
-    /* that gap is now the front, and the face turns to it */
+    /* that gap is now the front, and the face turns to it; then hands off */
     int k = legs[hi].hip - legs[lo].hip == 1 ? legs[lo].hip : legs[hi].hip;     /* gap k is legs k and k+1; 6 and 1 is 6 */
+    int was = front;
     set_front(k);
+    if (hands_off()) { set_front(was); return; }
     printf("      the front is now gap %d (legs %d and %d)\n", k, k, k % 6 + 1);
     /* z for a lift position of BOW_POS + offset, as leg_goals() works it out */
     legs[n1].z = height + legs[n1].lift_dir * (BOW_POS - CENTRE);
@@ -2405,8 +2499,9 @@ static void push_to(double ang, double cm, double peak, double rot)
     printf("\r\x1b[Kpushed towards %.0f deg, about %.0f cm (%.1f deg of 'tilt', %.1f of rotation): walking %d cycle%s towards gap %d\n",
            ang * 180 / M_PI, cm, peak, rot, cycles, cycles > 1 ? "s" : "", k);
     fflush(stdout);
-    set_front(k);
-    face_wait(700);                     /* the face turns first */
+    int was = front;
+    set_front(k);                       /* the face turns first */
+    if (hands_off()) { set_front(was); return; }
     walk(cycles, stride, 0);
 }
 

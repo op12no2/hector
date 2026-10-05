@@ -1564,7 +1564,13 @@ static void imu_stream(int secs)
  * BOW_TIP_ON degrees from level is a tip, and its direction at the biggest
  * tilt is kept, counting only samples where the total acceleration is within
  * BOW_STILL of level's (putting it down jolts it, with spikes bigger than the
- * tilt, any way); once it has been back under BOW_TIP_OFF for BOW_SETTLE_MS
+ * tilt, any way). Sliding it along reads as a tilt too (the accelerometer
+ * can't tell acceleration from tilt: a slide is a push of about 0.1 g for
+ * 0.3-0.5 s, 5-6 degrees, then a sharper stop the other way), so a tip also
+ * needs the gyro's rotation about horizontal axes, added up to the biggest
+ * tilt, to be at least BOW_ROT of that tilt (a tip rotates it as far as it
+ * tilts; a slide, about 1 degree), and the tilt held over BOW_TIP_ON for
+ * BOW_TIPPED_MS. Once it has been back under BOW_TIP_OFF for BOW_SETTLE_MS
  * (put down and still), it bows: the lifts of the two legs either side of that
  * way (leg k, hip id k, points at 30 - 60 (k - 1) degrees in imu_read()'s
  * axes: the legs go clockwise from the 1-2 gap) go to BOW_POS over BOW_MS (as
@@ -1577,6 +1583,8 @@ static void imu_stream(int secs)
 #define BOW_SETTLE_MS 300
 #define BOW_STILL     0.05    /* g */
 #define BOW_LEVEL_MS  300
+#define BOW_ROT       0.5     /* a tip's rotation (gyro, added up) is about its tilt; a slide's is a fraction */
+#define BOW_TIPPED_MS 250     /* over BOW_TIP_ON at least this long */
 #define BOW_POS       700     /* the near lifts' position, as move's (the offset is added) */
 #define BOW_MS        1000    /* to get there, and to stand again */
 #define BOW_HOLD_MS   500     /* bowed, before standing */
@@ -2377,7 +2385,7 @@ static int tips_relevel = 1;    /* take level again: after a command, which may 
 
 static int tips(void)
 {
-    static double a0[3], peak, pang, still_since, over_since;
+    static double a0[3], peak, pang, still_since, over_since, rot, rot_at_peak, tipped_ms, last_t;
     static int state;           /* 0 waiting for a tip, 1 tipped */
     double a[3], g[3];
     if (!standing || imu_st != 0) { tips_relevel = 1; return 0; }
@@ -2403,17 +2411,26 @@ static int tips(void)
     /* tilt from level, as the change in the horizontal part of gravity */
     double dx = a[0] - a0[0], dy = a[1] - a0[1];
     double tilt = asin(clampd(hypot(dx, dy), 0, 1)) * 180 / M_PI;
+    double dt = last_t ? t - last_t : 0;
+    last_t = t;
     if (state == 0) {
-        if (tilt > BOW_TIP_ON) { state = 1; peak = 0; still_since = 0; }
+        if (tilt > BOW_TIP_ON) { state = 1; peak = 0; still_since = 0; rot = rot_at_peak = 0; tipped_ms = 0; }
         return 0;
     }
+    rot += hypot(g[0], g[1]) * dt;
+    if (tilt > BOW_TIP_ON) tipped_ms += dt * 1000;
     double na = sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]), n0 = sqrt(a0[0] * a0[0] + a0[1] * a0[1] + a0[2] * a0[2]);
-    if (tilt > peak && fabs(na - n0) < BOW_STILL) { peak = tilt; pang = atan2(dy, dx); }
+    if (tilt > peak && fabs(na - n0) < BOW_STILL) { peak = tilt; pang = atan2(dy, dx); rot_at_peak = rot; }
     if (tilt >= BOW_TIP_OFF) { still_since = 0; return 0; }
     if (!still_since) still_since = t;
     if ((t - still_since) * 1000 < BOW_SETTLE_MS) return 0;
     state = 0;
     if (peak < BOW_TIP_ON) return 0;    /* only jolts: not a tip */
+    if (rot_at_peak < BOW_ROT * peak || tipped_ms < BOW_TIPPED_MS) {
+        printf("\r\x1b[Knot a tip: %.1f deg for %.0f ms, but it rotated only %.1f deg (slid?)\n", peak, tipped_ms, rot_at_peak);
+        fflush(stdout);
+        return 1;
+    }
     eyes_dirty = 1;
     bow_to(pang, peak);
     tips_relevel = 1;

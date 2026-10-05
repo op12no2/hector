@@ -145,6 +145,13 @@ static int con_getc(void)
     return usb_serial_jtag_read_bytes(&c, 1, con_block ? portMAX_DELAY : 0) == 1 ? c : -1;
 }
 
+/* next byte within ms, or -2 if none came (for the idle loop) */
+static int con_getc_ms(int ms)
+{
+    unsigned char c;
+    return usb_serial_jtag_read_bytes(&c, 1, pdMS_TO_TICKS(ms)) == 1 ? c : -2;
+}
+
 /* drop typed-ahead input */
 static void con_drop(void)
 {
@@ -386,6 +393,11 @@ static void scr_text(int x, int y, int scale, int colour, const char *s)
     }
 }
 
+static void scr_pixel(int x, int y, int colour)
+{
+    if (x >= 0 && x < 128 && y >= 0 && y < 128) fb[y * 128 + x] = (colour >> 8 & 0xFF) | (colour & 0xFF) << 8;
+}
+
 /* send fb to the panel */
 static void scr_show(void)
 {
@@ -615,6 +627,17 @@ static int con_getc(void)
     return read(0, &c, 1) == 1 ? c : -1;
 }
 
+/* next byte within ms, or -2 if none came (for the idle loop) */
+static int con_getc_ms(int ms)
+{
+    fd_set f;
+    struct timeval tv = { ms / 1000, ms % 1000 * 1000 };
+    FD_ZERO(&f);
+    FD_SET(0, &f);
+    if (select(1, &f, NULL, NULL, &tv) == 0) return -2;
+    return con_getc();
+}
+
 static void con_drop(void) { tcflush(0, TCIFLUSH); }
 
 static volatile sig_atomic_t halted;
@@ -651,6 +674,7 @@ static const char *scr_init(int *ok) { *ok = 0; return NULL; }
 static void scr_clear(void) {}
 static void scr_text(int x, int y, int scale, int colour, const char *s) { (void)x; (void)y; (void)scale; (void)colour; (void)s; }
 static void scr_show(void) {}
+static void scr_pixel(int x, int y, int colour) { (void)x; (void)y; (void)colour; }
 
 /* nor an IMU */
 static int imu_init(void) { return 1; }
@@ -1129,9 +1153,9 @@ static int check_servos(void)
  * settings, gains, positions); t_standing() needs the weight on the feet (the load
  * on each foot, sag, level, the highest load, the battery under load). Each
  * check logs a line on the console and a short one (10 characters) on the
- * ATOM's screen as it goes; t_end() then says Hi! on the screen, in green,
- * yellow if there were warnings, red if anything failed, with the problems
- * under it.
+ * ATOM's screen as it goes; then the eyes (alive()) come up, white, yellow if
+ * there were warnings, red if anything failed, with the first problem under
+ * them.
  */
 #define REG_UNLOAD        0x13  /* unloading conditions: bit 5 = overload protection */
 #define REG_PROT_TORQUE   0x25  /* then 0x26 protection time (40 ms units), 0x27 overload torque (%) */
@@ -1397,18 +1421,11 @@ static void t_standing(void)
            vmin < BATT_FLAT ? ": flat, charge it" : vmin < BATT_LOW ? ": low" : "");
 }
 
-/* the result: a line on the console, and Hi! on the screen */
+/* the result: a line on the console; the eyes (alive()) then show it in their colour */
 static int t_end(void)
 {
     printf("self test: %s\n", t_worst == T_OK ? "all ok" : t_worst == T_WARN ? "warnings" : "problems");
-    if (scr_what) {
-        msleep(1000);
-        scr_clear();
-        int y = t_nbad ? 8 : 46;
-        scr_text(21, y, 5, t_colour[t_worst], "Hi!");
-        t_draw(t_bad, t_nbad < 4 ? t_nbad : 4, 56);
-        scr_show();
-    }
+    if (scr_what) msleep(1000);         /* the log stays up a moment; then alive() draws the eyes */
     return t_worst;
 }
 
@@ -2110,6 +2127,96 @@ static int dispatch(char **tok, int nt)
     return 0;
 }
 
+/*
+ * ---- alive ----
+ * What runs while the REPL waits for a key: alive() every ALIVE_MS. For now
+ * the eyes on the ATOM's screen: they blink every few seconds (sometimes
+ * twice; the lid comes down from the top), glance about now and then, and
+ * look towards look_ang when look_on is set (radians in imu_read()'s axes).
+ * The screen's top points at leg 1 (+30 degrees), so its right is at -60.
+ * The whites are white, yellow or red after the self test's result, with its
+ * first problem under them.
+ */
+#define ALIVE_MS 20
+#define EYE_X    31             /* each eye's centre, from the screen's middle */
+#define EYE_Y    58
+#define EYE_RX   30             /* the whites: almond-shaped, pointed at the corners */
+#define EYE_UP   25             /* the top lid's curve above the centre, at the middle */
+#define EYE_DOWN 19             /* the bottom lid's, below */
+#define IRIS_R   17
+#define PUPIL_R  8
+#define LOOK_X   10             /* how far the irises move: across, up and down */
+#define LOOK_Y   4
+#define IRIS_COLOUR 0x2D5F      /* RGB565: a bright blue */
+
+static double look_ang;
+static int look_on;
+static int eyes_dirty = 1;      /* redraw: something else used the screen */
+
+static double frand(double lo, double hi) { return lo + (hi - lo) * rand() / (double)RAND_MAX; }
+
+static void eyes(void)
+{
+    static double next_blink, blink_t0 = -1, next_glance, glance_until, gx, gy, cx, cy;
+    static int last_open = -1, last_px = 999, last_py = 999;
+    double t = now();
+    if (!next_blink) { next_blink = t + frand(2, 5); next_glance = t + frand(4, 9); }
+
+    /* blink: closed and open again over 180 ms; now and then a second one straight after */
+    double open = 1;
+    if (blink_t0 < 0 && t >= next_blink) blink_t0 = t;
+    if (blink_t0 >= 0) {
+        double u = (t - blink_t0) / 0.18;
+        if (u >= 1) { blink_t0 = -1; next_blink = t + (rand() % 5 ? frand(2, 6) : 0.15); }
+        else open = fabs(1 - 2 * u);
+    }
+
+    /* glance somewhere for a second or two, then back */
+    if (t >= next_glance) {
+        double a = frand(0, 2 * M_PI), r = frand(0.4, 1);
+        gx = r * cos(a); gy = r * sin(a);
+        glance_until = t + frand(0.6, 1.8);
+        next_glance = t + frand(4, 10);
+    }
+    double tx = 0, ty = 0;                      /* where the pupils are heading: screen right, down */
+    if (t < glance_until) { tx = gx; ty = gy; }
+    else if (look_on) {
+        tx = cos(look_ang - -60 * M_PI / 180);
+        ty = -cos(look_ang - 30 * M_PI / 180);
+    }
+    cx += (tx - cx) * 0.25;
+    cy += (ty - cy) * 0.25;
+
+    int lid = (int)lround((EYE_UP + EYE_DOWN) * (1 - open)), px = (int)lround(cx * LOOK_X), py = (int)lround(cy * LOOK_Y);
+    if (!eyes_dirty && lid == last_open && px == last_px && py == last_py) return;
+    eyes_dirty = 0; last_open = lid; last_px = px; last_py = py;
+
+    static const int white[] = { 0xFFFF, 0xFFE0, 0xF800 };
+    scr_clear();
+    for (int side = -1; side <= 1; side += 2) {
+        int ex = 64 + side * EYE_X;
+        for (int x = -EYE_RX; x <= EYE_RX; x++) {
+            double u = (double)x / EYE_RX, k = 1 - u * u;          /* parabolas: pointed where they meet */
+            int top = -(int)lround(EYE_UP * k), bottom = (int)lround(EYE_DOWN * k);
+            if (top < -EYE_UP + lid) top = -EYE_UP + lid;           /* the lid, down from the top */
+            for (int y = top; y <= bottom; y++) {
+                int dx = x - px, dy = y - py, r2 = dx * dx + dy * dy, c = white[t_worst];
+                if ((x + 7) * (x + 7) + (y + 8) * (y + 8) <= 16) c = 0xFFFF;   /* the highlight stays put */
+                else if (r2 <= PUPIL_R * PUPIL_R) c = 0x0000;
+                else if (r2 <= IRIS_R * IRIS_R) c = IRIS_COLOUR;
+                scr_pixel(ex + x, EYE_Y + y, c);
+            }
+        }
+    }
+    if (t_nbad) scr_text(4, 108, 2, t_colour[t_bad[0].level], t_bad[0].s);
+    scr_show();
+}
+
+static void alive(void)
+{
+    if (scr_what) eyes();
+}
+
 /* minimal line editor for a tty: arrows, history, home/end, backspace */
 #define NHIST 100
 static char *hist[NHIST];
@@ -2138,8 +2245,11 @@ static int edit_line(char *buf, int size)
     int len = 0, cur = 0, h = nhist, ok = 1;
     buf[0] = 0;
     redraw(buf, len, cur);
+    eyes_dirty = 1;         /* back from a command, which may have used the screen */
     for (;;) {
-        int c = con_getc(), lf = c == '\n' && prev == '\r';
+        int c;
+        while ((c = con_getc_ms(ALIVE_MS)) == -2) alive();
+        int lf = c == '\n' && prev == '\r';
         prev = c;
         if (c < 0) { ok = 0; break; }
         if (lf) continue;

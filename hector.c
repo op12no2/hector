@@ -1100,7 +1100,7 @@ static const struct gait {
 };
 
 /* walk parameters (the set command) */
-static int gait = 0, step_ms = 800, stride = 50, lift = 70, height = 0;       /* gentle first-walk settings, for a new body */
+static int gait = 2, step_ms = 800, stride = 50, lift = 70, height = 0;       /* tripod, otherwise the gentle first-walk settings */
 static const struct param { const char *name; int *v, min, max; const char *what; } params[] = {
     { "gait",   &gait,    0,   2,        "wave, ripple or tripod (1, 2 or 3 legs up at a time)" },
     { "step",   &step_ms, 200, 5000,     "ms each leg spends in the air" },
@@ -1584,6 +1584,11 @@ static void imu_stream(int secs)
 #define BOW_STILL     0.05    /* g */
 #define BOW_LEVEL_MS  300
 #define BOW_ROT       0.5     /* a tip's rotation (gyro, added up) is about its tilt; a slide's is a fraction */
+#define SLIDE_ROT     0.3     /* a push: rotation under this fraction of its "tilt"... */
+#define SLIDE_MIN     5.0     /* ...of at least this many degrees */
+#define SLIDE_PRE_MS  400     /* a push is added up from this long before it showed as a tilt (a gentle push doesn't) */
+#define SLIDE_DEAD    0.015   /* g: less is taken as nothing, so noise doesn't add up */
+#define SLIDE_HIST    128     /* the last 2.5 s of horizontal acceleration */
 #define BOW_TIPPED_MS 250     /* over BOW_TIP_ON at least this long */
 #define BOW_POS       700     /* the near lifts' position, as move's (the offset is added) */
 #define BOW_MS        1000    /* to get there, and to stand again */
@@ -2377,8 +2382,38 @@ static void bow_to(double pang, double peak)
 }
 
 /*
- * The IMU, from alive() while it's standing: tips (above, at bow_to) and
- * being knocked over (gravity off z, under 0.5 g, for a second: it sits).
+ * Pushed (slid along the desk): it walks on the way it was pushed. The front
+ * becomes the gap nearest that way, the face turns there, then it walks with
+ * the current gait: PUSH_CYCLES cycles for a short push (under PUSH_SHORT
+ * cm), twice that for a medium one (under PUSH_LONG), three times for a long
+ * one. Its way and distance come
+ * from adding up the horizontal acceleration twice, from SLIDE_PRE_MS before
+ * it first showed as a tilt (a gentle push only crosses BOW_TIP_ON at its
+ * sharper stop, which points the other way): the way it moved, not its first
+ * jolt. Rough (perhaps +-50% on distance) but it tells short from long.
+ */
+#define PUSH_SHORT  6.0
+#define PUSH_LONG   12.0
+#define PUSH_CYCLES 2           /* 1 was too short (the user, 2026-10-05) */
+
+static void walk(int cycles, int str, int turn);
+
+static void push_to(double ang, double cm, double peak, double rot)
+{
+    int k = ((int)lround(-ang * 180 / M_PI / 60) % 6 + 6) % 6 + 1;     /* gap k at -60 (k - 1) degrees */
+    int cycles = PUSH_CYCLES * (cm < PUSH_SHORT ? 1 : cm < PUSH_LONG ? 2 : 3);
+    printf("\r\x1b[Kpushed towards %.0f deg, about %.0f cm (%.1f deg of 'tilt', %.1f of rotation): walking %d cycle%s towards gap %d\n",
+           ang * 180 / M_PI, cm, peak, rot, cycles, cycles > 1 ? "s" : "", k);
+    fflush(stdout);
+    set_front(k);
+    face_wait(700);                     /* the face turns first */
+    walk(cycles, stride, 0);
+}
+
+/*
+ * The IMU, from alive() while it's standing: tips (above, at bow_to), pushes
+ * (push_to) and being knocked over (gravity off z, under 0.5 g, for a second:
+ * it sits).
  * 1 if it printed.
  */
 static int tips_relevel = 1;    /* take level again: after a command, which may have moved it */
@@ -2386,6 +2421,9 @@ static int tips_relevel = 1;    /* take level again: after a command, which may 
 static int tips(void)
 {
     static double a0[3], peak, pang, still_since, over_since, rot, rot_at_peak, tipped_ms, last_t;
+    static double t_start;
+    static struct { double t, x, y; } hist[SLIDE_HIST];       /* horizontal acceleration from level, g */
+    static int nhist;
     static int state;           /* 0 waiting for a tip, 1 tipped */
     double a[3], g[3];
     if (!standing || imu_st != 0) { tips_relevel = 1; return 0; }
@@ -2413,8 +2451,12 @@ static int tips(void)
     double tilt = asin(clampd(hypot(dx, dy), 0, 1)) * 180 / M_PI;
     double dt = last_t ? t - last_t : 0;
     last_t = t;
+    hist[nhist % SLIDE_HIST].t = t;
+    hist[nhist % SLIDE_HIST].x = dx;
+    hist[nhist % SLIDE_HIST].y = dy;
+    nhist++;
     if (state == 0) {
-        if (tilt > BOW_TIP_ON) { state = 1; peak = 0; still_since = 0; rot = rot_at_peak = 0; tipped_ms = 0; }
+        if (tilt > BOW_TIP_ON) { state = 1; peak = 0; still_since = 0; rot = rot_at_peak = 0; tipped_ms = 0; t_start = t; }
         return 0;
     }
     rot += hypot(g[0], g[1]) * dt;
@@ -2426,6 +2468,23 @@ static int tips(void)
     if ((t - still_since) * 1000 < BOW_SETTLE_MS) return 0;
     state = 0;
     if (peak < BOW_TIP_ON) return 0;    /* only jolts: not a tip */
+    if (rot_at_peak < SLIDE_ROT * peak && peak >= SLIDE_MIN) {
+        /* where it went: the acceleration added up twice, from a little before it showed */
+        double vx = 0, vy = 0, sx = 0, sy = 0, tp = 0;
+        for (int n = nhist > SLIDE_HIST ? nhist - SLIDE_HIST : 0; n < nhist; n++) {
+            double ht = hist[n % SLIDE_HIST].t, hx = hist[n % SLIDE_HIST].x, hy = hist[n % SLIDE_HIST].y;
+            if (ht < t_start - SLIDE_PRE_MS / 1000.0) continue;
+            if (tp) {
+                double d = ht - tp;
+                if (hypot(hx, hy) > SLIDE_DEAD) { vx += hx * 9.81 * d; vy += hy * 9.81 * d; }
+                sx += vx * d; sy += vy * d;
+            }
+            tp = ht;
+        }
+        push_to(atan2(sy, sx), hypot(sx, sy) * 100, peak, rot_at_peak);
+        tips_relevel = 1;
+        return 1;
+    }
     if (rot_at_peak < BOW_ROT * peak || tipped_ms < BOW_TIPPED_MS) {
         printf("\r\x1b[Knot a tip: %.1f deg for %.0f ms, but it rotated only %.1f deg (slid?)\n", peak, tipped_ms, rot_at_peak);
         fflush(stdout);

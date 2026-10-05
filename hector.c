@@ -906,8 +906,6 @@ static void help(void)
     "loads [secs]              stream every servo's load and position error (default 10 s, or until a key);\n"
     "                          reads only: stand first to see what pushing on it does\n"
     "imu [secs]                stream the ATOM's IMU: acceleration, rotation and tilt (default 10 s, or until a key)\n"
-    "bow [secs]                stand; tip it up at an edge and put it down, and it bows towards that edge\n"
-    "                          and back up (needs the ATOM's IMU); until a key, or secs seconds\n"
     "selftest                  the startup checks again (reads only, nothing moves): servos, battery,\n"
     "                          temperature, errors, overload settings, positions, load; on the ATOM's screen too");
 }
@@ -1167,8 +1165,8 @@ static int check_servos(void)
 #define BATT_LOW  70            /* 2S, 0.1 V */
 #define BATT_FLAT 66
 #define BATT_HIGH 87            /* a full 2S reads up to 8.6 on some servos */
-#define FEET_SPREAD 30          /* 0.1%: a lift's load this far from the mean is uneven (with the lifts'
-                                   I = 1 they stand within about 1.5%; with I = 0 loads only read 0, 6,
+#define FEET_SPREAD 50          /* 0.1%: a lift's load this far from the mean is uneven (with the lifts'
+                                   I = 1 they stand within about 1-4%; with I = 0 loads only read 0, 6,
                                    7.5... one value per step a foot is pushed up, and can't be evened) */
 #define SAG_MAX   6             /* steps a foot may be pushed up from its goal standing (2-4 is usual) */
 #define LEVEL_MAX 5.0           /* deg of tilt standing */
@@ -1533,23 +1531,25 @@ static void imu_stream(int secs)
 }
 
 /*
- * Tip it up at an edge and put it down: it bows towards that edge and comes
- * back up. Stands, takes the IMU's reading as level, then at 50 Hz: a tilt of
- * over BOW_TIP_ON degrees from level is a tip, and its direction at the
- * biggest tilt is kept, counting only samples where the total acceleration is
- * within BOW_STILL of what it was level (putting it down jolts it, with
- * spikes bigger than the tilt, any way); once it has been back under BOW_TIP_OFF for
- * BOW_SETTLE_MS (put down and still), it bows: the lifts of the two legs
- * either side of that way (leg k, hip id k, points at 30 - 60 (k - 1)
- * degrees in imu_read()'s axes: the legs go clockwise from the 1-2 gap) go
- * to BOW_POS over BOW_MS (as "move 7-8 700 1000" for legs 1 and 2), so that
- * edge of the body comes down (it's designed to land safely); it holds
- * BOW_HOLD_MS, stands, and re-takes level. Until a key, or secs seconds.
+ * Bowing, from alive() while it's standing (tips(), below): tip it up at an
+ * edge and put it down, and it bows towards that edge. Level is the IMU's
+ * reading taken BOW_LEVEL_MS after a stand or a command. A tilt of over
+ * BOW_TIP_ON degrees from level is a tip, and its direction at the biggest
+ * tilt is kept, counting only samples where the total acceleration is within
+ * BOW_STILL of level's (putting it down jolts it, with spikes bigger than the
+ * tilt, any way); once it has been back under BOW_TIP_OFF for BOW_SETTLE_MS
+ * (put down and still), it bows: the lifts of the two legs either side of that
+ * way (leg k, hip id k, points at 30 - 60 (k - 1) degrees in imu_read()'s
+ * axes: the legs go clockwise from the 1-2 gap) go to BOW_POS over BOW_MS (as
+ * "move 7-8 700 1000" for legs 1 and 2), so that edge of the body comes down
+ * (it's designed to land safely); it holds BOW_HOLD_MS, stands, and takes
+ * level again. The eyes then look that way.
  */
 #define BOW_TIP_ON    3.0     /* deg */
 #define BOW_TIP_OFF   1.5
 #define BOW_SETTLE_MS 300
 #define BOW_STILL     0.05    /* g */
+#define BOW_LEVEL_MS  300
 #define BOW_POS       700     /* the near lifts' position, as move's (the offset is added) */
 #define BOW_MS        1000    /* to get there, and to stand again */
 #define BOW_HOLD_MS   500     /* bowed, before standing */
@@ -1571,75 +1571,6 @@ static int bow_level(double a0[3], int ms)
 
 /* where leg (hip id) k points, radians, in imu_read()'s axes */
 static double leg_ang(int k) { return (30 - 60 * (k - 1)) * M_PI / 180; }
-
-static void bow_screen(const char *s, int colour)
-{
-    if (!scr_what) return;
-    scr_clear();
-    scr_text(4, 4, 2, 0xFFFF, "bow");
-    scr_text(4, 56, 2, colour, s);
-    scr_show();
-}
-
-static void bow(int secs)
-{
-    double a0[3], a[3], g[3];
-    if (imu_read(a, g)) { puts("no IMU"); return; }
-    if (stand(1000)) return;
-    if (bow_level(a0, 500)) { puts("IMU read failed"); return; }
-    printf("tip me up at an edge and put me down; a key stops\n");
-    bow_screen("tip me", 0x07E0);
-    con_raw(0);
-    con_drop();
-    double t0 = now(), peak = 0, pang = 0;
-    int state = 0, settle = 0;          /* 0 waiting for a tip, 1 tipped */
-    tick_start();
-    while ((!secs || now() - t0 < secs) && con_getc() < 0 && !halted) {
-        tick_wait(TICK_MS);
-        if (imu_read(a, g)) { puts("IMU read failed"); break; }
-        /* tilt from level, as the change in the horizontal part of gravity: + x = front up, + y = left up */
-        double dx = a[0] - a0[0], dy = a[1] - a0[1];
-        double tilt = asin(clampd(hypot(dx, dy), 0, 1)) * 180 / M_PI;
-        if (state == 0) {
-            if (tilt > BOW_TIP_ON) { state = 1; peak = 0; settle = 0; bow_screen("...", 0xFFE0); }
-            continue;
-        }
-        double na = sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]), n0 = sqrt(a0[0] * a0[0] + a0[1] * a0[1] + a0[2] * a0[2]);
-        if (tilt > peak && fabs(na - n0) < BOW_STILL) { peak = tilt; pang = atan2(dy, dx); }
-        settle = tilt < BOW_TIP_OFF ? settle + TICK_MS : 0;
-        if (settle < BOW_SETTLE_MS) continue;
-        if (peak < BOW_TIP_ON) { state = 0; bow_screen("tip me", 0x07E0); continue; }     /* only jolts: not a tip */
-
-        /* the two legs pointing most nearly that way */
-        double c[6];
-        int n1 = 0, n2 = 1;
-        for (int i = 0; i < 6; i++) c[i] = cos(leg_ang(legs[i].hip) - pang);
-        for (int i = 0; i < 6; i++) if (c[i] > c[n1]) n1 = i;
-        if (n2 == n1) n2 = 0;
-        for (int i = 0; i < 6; i++) if (i != n1 && c[i] > c[n2]) n2 = i;
-        int lo = legs[n1].hip < legs[n2].hip ? n1 : n2, hi = lo == n1 ? n2 : n1;
-        char s[16];
-        snprintf(s, sizeof s, "legs %d+%d", legs[lo].hip, legs[hi].hip);
-        printf("tipped %.1f deg towards %.0f deg: bowing on %s (lifts %d, %d)\n", peak, pang * 180 / M_PI, s,
-               legs[lo].lift, legs[hi].lift);
-        fflush(stdout);
-        bow_screen(s, 0x07E0);
-        /* z for a lift position of BOW_POS + offset, as leg_goals() works it out */
-        legs[n1].z = height + legs[n1].lift_dir * (BOW_POS - CENTRE);
-        legs[n2].z = height + legs[n2].lift_dir * (BOW_POS - CENTRE);
-        send_pose(BOW_MS);
-        msleep(BOW_MS + BOW_HOLD_MS);
-        if (halted || stand(BOW_MS)) break;
-        if (bow_level(a0, 300)) { puts("IMU read failed"); break; }
-        bow_screen("tip me", 0x07E0);
-        state = 0;
-        tick_start();
-    }
-    con_restore();
-    for (int i = 0; i < 6; i++) legs[i].z = 0;
-    send_pose(BOW_MS);
-    bow_screen("", 0);
-}
 
 /* all feet down, hips centred, taking ms */
 static int stand(int ms)
@@ -2055,7 +1986,6 @@ static int run(char **tok, int nt)
     else if (!strcmp(c, "selftest")) selftest();
     else if (!strcmp(c, "loads")) loads(arg(tok, 1, nt, 10, NULL));
     else if (!strcmp(c, "imu")) imu_stream(arg(tok, 1, nt, 10, NULL));
-    else if (!strcmp(c, "bow")) bow(arg(tok, 1, nt, 0, NULL));
     else if (!strcmp(c, "sit")) sit(arg(tok, 1, nt, 1000, NULL));
     else if (!strcmp(c, "set")) {
         const struct param *p = NULL;
@@ -2340,10 +2270,86 @@ static int watch(void)
     return printed;
 }
 
+/* bow towards pang (radians, imu_read()'s axes), then stand again */
+static void bow_to(double pang, double peak)
+{
+    double c[6];
+    int n1 = 0, n2 = 1;
+    for (int i = 0; i < 6; i++) c[i] = cos(leg_ang(legs[i].hip) - pang);
+    for (int i = 0; i < 6; i++) if (c[i] > c[n1]) n1 = i;
+    if (n2 == n1) n2 = 0;
+    for (int i = 0; i < 6; i++) if (i != n1 && c[i] > c[n2]) n2 = i;
+    int lo = legs[n1].hip < legs[n2].hip ? n1 : n2, hi = lo == n1 ? n2 : n1;
+    printf("\r\x1b[Ktipped %.1f deg towards %.0f deg: bowing on legs %d+%d (lifts %d, %d)\n", peak, pang * 180 / M_PI,
+           legs[lo].hip, legs[hi].hip, legs[lo].lift, legs[hi].lift);
+    fflush(stdout);
+    look_ang = pang;
+    look_on = 1;
+    /* z for a lift position of BOW_POS + offset, as leg_goals() works it out */
+    legs[n1].z = height + legs[n1].lift_dir * (BOW_POS - CENTRE);
+    legs[n2].z = height + legs[n2].lift_dir * (BOW_POS - CENTRE);
+    send_pose(BOW_MS);
+    msleep(BOW_MS + BOW_HOLD_MS);
+    stand(BOW_MS);
+}
+
+/*
+ * The IMU, from alive() while it's standing: tips (above, at bow_to) and
+ * being knocked over (gravity off z, under 0.5 g, for a second: it sits).
+ * 1 if it printed.
+ */
+static int tips_relevel = 1;    /* take level again: after a command, which may have moved it */
+
+static int tips(void)
+{
+    static double a0[3], peak, pang, still_since, over_since;
+    static int state;           /* 0 waiting for a tip, 1 tipped */
+    double a[3], g[3];
+    if (!standing || imu_st != 0) { tips_relevel = 1; return 0; }
+    if (tips_relevel) {
+        if (bow_level(a0, BOW_LEVEL_MS)) return 0;
+        tips_relevel = 0;
+        state = 0;
+        over_since = 0;
+        return 0;
+    }
+    if (imu_read(a, g)) return 0;
+    double t = now();
+
+    if (a[2] < 0.5) {
+        if (!over_since) over_since = t;
+        if (t - over_since > 1) {
+            printf("\r\x1b[Kknocked over? sitting down\n");
+            sit(1000);
+            return 1;
+        }
+    } else over_since = 0;
+
+    /* tilt from level, as the change in the horizontal part of gravity */
+    double dx = a[0] - a0[0], dy = a[1] - a0[1];
+    double tilt = asin(clampd(hypot(dx, dy), 0, 1)) * 180 / M_PI;
+    if (state == 0) {
+        if (tilt > BOW_TIP_ON) { state = 1; peak = 0; still_since = 0; }
+        return 0;
+    }
+    double na = sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]), n0 = sqrt(a0[0] * a0[0] + a0[1] * a0[1] + a0[2] * a0[2]);
+    if (tilt > peak && fabs(na - n0) < BOW_STILL) { peak = tilt; pang = atan2(dy, dx); }
+    if (tilt >= BOW_TIP_OFF) { still_since = 0; return 0; }
+    if (!still_since) still_since = t;
+    if ((t - still_since) * 1000 < BOW_SETTLE_MS) return 0;
+    state = 0;
+    if (peak < BOW_TIP_ON) return 0;    /* only jolts: not a tip */
+    eyes_dirty = 1;
+    bow_to(pang, peak);
+    tips_relevel = 1;
+    return 1;
+}
+
 /* 1 if it printed (so the line being typed needs redrawing) */
 static int alive(void)
 {
     int printed = watch();
+    printed |= tips();
     if (scr_what) eyes();
     return printed;
 }
@@ -2377,6 +2383,7 @@ static int edit_line(char *buf, int size)
     buf[0] = 0;
     redraw(buf, len, cur);
     eyes_dirty = 1;         /* back from a command, which may have used the screen */
+    tips_relevel = 1;       /* or moved it */
     for (;;) {
         int c;
         while ((c = con_getc_ms(ALIVE_MS)) == -2)

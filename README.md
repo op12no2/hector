@@ -52,6 +52,7 @@ Leg *n* is hip (yaw) servo *n* and lift servo *n*+6. Where each leg is, and whic
 | `calibrate` | stand, then nudge the lift offsets, a step or two at a time from where they are, until all six feet carry the same load (within 1.5%); prints the offset table to paste into `hector.c` |
 | `walk [cycles] [stride] [turn]` | stand, then walk with the current gait; stride < 0 walks backwards, turn > 0 turns left (stride 0 turns on the spot); with no cycles it walks until a key is pressed; a key stops it gracefully (legs step back to centre), ctrl-c freezes it where it is; afterwards it prints each servo's peak load (a servo held over 80% for 4 s drops to 20% torque) |
 | `set [name value]` | list or set walk parameters (below) |
+| `loads [secs]` | stream every servo's load and position error (goal and position both read from the servo) as fast as the bus allows, about 80 sweeps of all 12 a second, for secs seconds (default 10) or until a key; reads only, so stand first. The ATOM's screen shows the seconds, to time presses by |
 | `selftest` | the checks it runs at startup, again (they only read, nothing moves): every servo replies, battery (warns under 7.0 V, fails under 6.6), temperature, error bits, overload protection at the defaults, positions inside the range the legs are driven over, and the highest load. On the ATOM each check also goes up on the screen as it runs, then the screen says Hi! (green, yellow with warnings, red with failures) with any problems under it |
 
 | Parameter | Default | |

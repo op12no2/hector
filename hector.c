@@ -793,6 +793,8 @@ static void help(void)
     "                          turn > 0 turns left (stride 0 turns on the spot); no cycles = until a key;\n"
     "                          a key stops (it finishes the step and brings the legs to centre), ctrl-c freezes\n"
     "set [name value]          list or set walk parameters: gait step stride lift height\n"
+    "loads [secs]              stream every servo's load and position error (default 10 s, or until a key);\n"
+    "                          reads only: stand first to see what pushing on it does\n"
     "selftest                  the startup checks again (reads only, nothing moves): servos, battery,\n"
     "                          temperature, errors, overload settings, positions, load; on the ATOM's screen too");
 }
@@ -1204,6 +1206,51 @@ done:
     return t_worst;
 }
 
+/*
+ * Stream every servo's load and position error for secs seconds (or until a
+ * key), to see what pushing on the robot looks like. Reads only. A line per
+ * sweep of the 12: ms since the start, then per leg (LF LM LR RF RM RR) hip
+ * load/error and lift load/error. The error is present minus goal position,
+ * both read from the servo. Signed by hip_dir/lift_dir: a lift's + load is the
+ * foot pushing down and + error the foot above its goal; a hip's + is forward.
+ * The screen shows the seconds, to time presses by.
+ */
+static void loads(int secs)
+{
+    char buf[16];
+    printf("ms      LF hip  lift    LM hip  lift    LR hip  lift    RF hip  lift    RM hip  lift    RR hip  lift   (load/error)\n");
+    con_raw(0);
+    con_drop();
+    double t0 = now();
+    int shown = -1;
+    while (now() - t0 < secs && con_getc() < 0 && !halted) {
+        int t = (now() - t0) * 1000;
+        if (scr_what && t / 1000 != shown) {
+            shown = t / 1000;
+            snprintf(buf, sizeof buf, "%d", shown);
+            scr_clear();
+            scr_text(4, 4, 2, 0xFFFF, "loads");
+            scr_text(64 - (int)strlen(buf) * 18, 40, 6, 0xFFFF, buf);
+            scr_show();
+        }
+        printf("%6d", t);
+        for (int i = 0; i < 6; i++)
+            for (int j = 0; j < 2; j++) {
+                const struct leg *L = &legs[i];
+                int id = j ? L->lift : L->hip, dir = j ? L->lift_dir : L->hip_dir;
+                unsigned char b[20];
+                if (read_regs(id, REG_GOAL_POS, 20, b) != 20) { printf("      -/-"); continue; }
+                int goal = get16(b), pos = get16(b + REG_PRESENT_POS - REG_GOAL_POS);
+                int ld = get16(b + REG_PRESENT_LOAD - REG_GOAL_POS);
+                ld = ld & 0x400 ? -(ld & 0x3FF) : ld & 0x3FF;
+                printf("%s %4d/%-3d", j ? "" : "  ", dir * ld, dir * (pos - goal));
+            }
+        putchar('\n');
+    }
+    con_restore();
+    if (scr_what) { scr_clear(); scr_show(); }
+}
+
 /* all feet down, hips centred, taking ms */
 static int stand(int ms)
 {
@@ -1590,6 +1637,7 @@ static int run(char **tok, int nt)
         walk(cycles, str, turn);
     }
     else if (!strcmp(c, "selftest")) selftest();
+    else if (!strcmp(c, "loads")) loads(arg(tok, 1, nt, 10, NULL));
     else if (!strcmp(c, "set")) {
         const struct param *p = NULL;
         for (int i = 0; nt > 1 && i < (int)(sizeof params / sizeof *params); i++)

@@ -1138,7 +1138,9 @@ static int check_servos(void)
 #define BATT_LOW  70            /* 2S, 0.1 V */
 #define BATT_FLAT 66
 #define BATT_HIGH 87            /* a full 2S reads up to 8.6 on some servos */
-#define FEET_SPREAD 30          /* 0.1%: a lift's load this far from the mean is uneven */
+#define FEET_SPREAD 80          /* 0.1%: a lift's load this far from the mean is uneven. Loads read
+                                   0 (dead zone), 6, 7.5, 9... one value per step a foot is pushed
+                                   up, so standing on 1-3 steps they can't be evened out finer */
 #define SAG_MAX   6             /* steps a foot may be pushed up from its goal standing (2-4 is usual) */
 #define LEVEL_MAX 5.0           /* deg of tilt standing */
 

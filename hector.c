@@ -28,6 +28,8 @@
 #include <unistd.h>
 #ifdef ESP_PLATFORM
 #include "driver/gpio.h"
+#include "driver/i2c_master.h"
+#include "driver/spi_master.h"
 #include "driver/uart.h"
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
@@ -81,8 +83,8 @@ static void die(const char *fmt, ...)
 /*
  * ---- I/O ----
  * The servo bus (open_port, bus_flush, bus_write, read_bytes), the console
- * (con_*) and timing (msleep, tick_*). Everything else is the same on the Pi
- * and the ATOM.
+ * (con_*), timing (msleep, tick_*) and the screen (scr_*: the ATOM's; stubs on
+ * the Pi). Everything else is the same on the Pi and the ATOM.
  */
 #ifdef ESP_PLATFORM
 
@@ -160,6 +162,296 @@ static void msleep(int ms) { vTaskDelay(pdMS_TO_TICKS(ms)); }
 static TickType_t tick_last;
 static void tick_start(void) { tick_last = xTaskGetTickCount(); }
 static void tick_wait(int ms) { xTaskDelayUntil(&tick_last, pdMS_TO_TICKS(ms)); }
+
+/*
+ * The screen: 0.85" 128x128 on SPI (MOSI G21, SCLK G15, CS G14, DC G42, RST G48).
+ * The panel is a GC9107, or an ST7735S on some batches, told apart by RDDID as
+ * M5GFX does (init sequences and offsets are from M5GFX too). The backlight is
+ * an LP5562 LED driver on the internal I2C (SDA G45, SCL G0, shared with the IMU).
+ * Drawing goes into fb[], and scr_show() sends all of it (32 KB, about 7 ms).
+ */
+#define LCD_HOST SPI3_HOST
+#define LCD_MOSI 21
+#define LCD_SCLK 15
+#define LCD_CS   14
+#define LCD_DC   42
+#define LCD_RST  48
+#define BL_SDA   45
+#define BL_SCL   0
+#define BL_ADDR  0x30   /* LP5562 */
+#define BL_LEVEL 160    /* 0..255 */
+
+static spi_device_handle_t lcd;
+static int lcd_x0, lcd_y0;              /* where the 128x128 window starts in the controller's memory */
+static uint16_t fb[128 * 128];          /* RGB565, byte-swapped: sent high byte first */
+
+/*
+ * Init lists: command, number of parameters (| 0x80 if a delay follows),
+ * parameters, then the delay in ms (255 = 500); 0xFF ends the list.
+ */
+static const unsigned char gc9107_init[] = {
+    0xFE, 0x80, 5,
+    0xEF, 0x80, 5,
+    0xB0, 1, 0xC0,  0xB2, 1, 0x2F,  0xB3, 1, 0x03,  0xB6, 1, 0x19,  0xB7, 1, 0x01,
+    0xAC, 1, 0xCB,  0xAB, 1, 0x0E,  0xB4, 1, 0x04,  0xA8, 1, 0x19,  0xB8, 1, 0x08,
+    0xE8, 1, 0x24,  0xE9, 1, 0x48,  0xEA, 1, 0x22,  0xC6, 1, 0x30,  0xC7, 1, 0x18,
+    0xF0, 14, 0x01, 0x2B, 0x23, 0x3C, 0xB7, 0x12, 0x17, 0x60, 0x00, 0x06, 0x0C, 0x17, 0x12, 0x1F,
+    0xF1, 14, 0x05, 0x2E, 0x2D, 0x44, 0xD6, 0x15, 0x17, 0xA0, 0x02, 0x0D, 0x0D, 0x1A, 0x18, 0x1F,
+    0x11, 0x80, 120,                    /* sleep out */
+    0x29, 0,                            /* display on */
+    0x3A, 1, 0x55,                      /* 16-bit colour */
+    0x36, 1, 0x08,                      /* MADCTL: BGR */
+    0x20, 0,                            /* inversion off */
+    0xFF,
+};
+static const unsigned char st7735s_init[] = {
+    0x01, 0x80, 150,                    /* software reset */
+    0x11, 0x80, 255,                    /* sleep out */
+    0xB1, 3, 0x01, 0x2C, 0x2D,
+    0xB2, 3, 0x01, 0x2C, 0x2D,
+    0xB3, 6, 0x01, 0x2C, 0x2D, 0x01, 0x2C, 0x2D,
+    0xB4, 1, 0x07,
+    0xC0, 3, 0xA2, 0x02, 0x84,  0xC1, 1, 0xC5,  0xC2, 2, 0x0A, 0x00,  0xC3, 2, 0x8A, 0x2A,
+    0xC4, 2, 0x8A, 0xEE,  0xC5, 1, 0x0E,
+    0xE0, 16, 0x02, 0x1C, 0x07, 0x12, 0x37, 0x32, 0x29, 0x2D, 0x29, 0x25, 0x2B, 0x39, 0x00, 0x01, 0x03, 0x10,
+    0xE1, 16, 0x03, 0x1D, 0x07, 0x06, 0x2E, 0x2C, 0x29, 0x2D, 0x2E, 0x2E, 0x37, 0x3F, 0x00, 0x00, 0x02, 0x10,
+    0x13, 0x80, 10,                     /* normal display on */
+    0x29, 0x80, 100,                    /* display on */
+    0x3A, 1, 0x55,                      /* 16-bit colour */
+    0x36, 1, 0xDC,                      /* MADCTL: rotated 180, BGR */
+    0x21, 0,                            /* inversion on */
+    0xFF,
+};
+
+/* the panel's id (RDDID, 3-wire: one dummy bit, then 32 bits back on MOSI) */
+static uint32_t lcd_id(int hz)
+{
+    spi_device_interface_config_t d = {
+        .command_bits = 8, .dummy_bits = 1, .clock_speed_hz = hz, .spics_io_num = LCD_CS,
+        .queue_size = 1, .flags = SPI_DEVICE_3WIRE | SPI_DEVICE_HALFDUPLEX,
+    };
+    spi_device_handle_t h;
+    if (spi_bus_add_device(LCD_HOST, &d, &h) != ESP_OK) return 0;
+    spi_transaction_t t = { .cmd = 0x04, .rxlength = 32, .flags = SPI_TRANS_USE_RXDATA };
+    uint32_t id = 0;
+    gpio_set_level(LCD_DC, 0);
+    if (spi_device_polling_transmit(h, &t) == ESP_OK)
+        id = t.rx_data[0] | t.rx_data[1] << 8 | t.rx_data[2] << 16 | (uint32_t)t.rx_data[3] << 24;
+    spi_bus_remove_device(h);
+    return id;
+}
+
+/* dc 0 = command, 1 = data */
+static void lcd_send(int dc, const void *p, int n)
+{
+    spi_transaction_t t = { .length = n * 8, .tx_buffer = p };
+    gpio_set_level(LCD_DC, dc);
+    spi_device_polling_transmit(lcd, &t);
+}
+
+static void lcd_cmds(const unsigned char *c)
+{
+    while (*c != 0xFF) {
+        unsigned char cmd = *c++, n = *c++, par[16];
+        lcd_send(0, &cmd, 1);
+        memcpy(par, c, n & 0x7F);           /* via RAM: DMA can't read flash */
+        if (n & 0x7F) lcd_send(1, par, n & 0x7F);
+        c += n & 0x7F;
+        if (n & 0x80) { int ms = *c++; msleep(ms == 255 ? 500 : ms); }
+    }
+}
+
+/*
+ * 5x7 font, ' ' to '~', a byte per column, bit 0 at the top. From Adafruit GFX's
+ * glcdfont.c: Copyright (c) 2012 Adafruit Industries. All rights reserved.
+ * BSD licence: redistributions must keep this notice. THIS SOFTWARE IS PROVIDED
+ * BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED
+ * WARRANTIES ARE DISCLAIMED (full text in Adafruit-GFX-Library's glcdfont.c).
+ */
+static const unsigned char font5x7[95][5] = {
+    { 0x00, 0x00, 0x00, 0x00, 0x00 },  /* ' ' */
+    { 0x00, 0x00, 0x5F, 0x00, 0x00 },  /* '!' */
+    { 0x00, 0x07, 0x00, 0x07, 0x00 },  /* '"' */
+    { 0x14, 0x7F, 0x14, 0x7F, 0x14 },  /* '#' */
+    { 0x24, 0x2A, 0x7F, 0x2A, 0x12 },  /* '$' */
+    { 0x23, 0x13, 0x08, 0x64, 0x62 },  /* '%' */
+    { 0x36, 0x49, 0x56, 0x20, 0x50 },  /* '&' */
+    { 0x00, 0x08, 0x07, 0x03, 0x00 },  /* "'" */
+    { 0x00, 0x1C, 0x22, 0x41, 0x00 },  /* '(' */
+    { 0x00, 0x41, 0x22, 0x1C, 0x00 },  /* ')' */
+    { 0x2A, 0x1C, 0x7F, 0x1C, 0x2A },  /* '*' */
+    { 0x08, 0x08, 0x3E, 0x08, 0x08 },  /* '+' */
+    { 0x00, 0x80, 0x70, 0x30, 0x00 },  /* ',' */
+    { 0x08, 0x08, 0x08, 0x08, 0x08 },  /* '-' */
+    { 0x00, 0x00, 0x60, 0x60, 0x00 },  /* '.' */
+    { 0x20, 0x10, 0x08, 0x04, 0x02 },  /* '/' */
+    { 0x3E, 0x51, 0x49, 0x45, 0x3E },  /* '0' */
+    { 0x00, 0x42, 0x7F, 0x40, 0x00 },  /* '1' */
+    { 0x72, 0x49, 0x49, 0x49, 0x46 },  /* '2' */
+    { 0x21, 0x41, 0x49, 0x4D, 0x33 },  /* '3' */
+    { 0x18, 0x14, 0x12, 0x7F, 0x10 },  /* '4' */
+    { 0x27, 0x45, 0x45, 0x45, 0x39 },  /* '5' */
+    { 0x3C, 0x4A, 0x49, 0x49, 0x31 },  /* '6' */
+    { 0x41, 0x21, 0x11, 0x09, 0x07 },  /* '7' */
+    { 0x36, 0x49, 0x49, 0x49, 0x36 },  /* '8' */
+    { 0x46, 0x49, 0x49, 0x29, 0x1E },  /* '9' */
+    { 0x00, 0x00, 0x14, 0x00, 0x00 },  /* ':' */
+    { 0x00, 0x40, 0x34, 0x00, 0x00 },  /* ';' */
+    { 0x00, 0x08, 0x14, 0x22, 0x41 },  /* '<' */
+    { 0x14, 0x14, 0x14, 0x14, 0x14 },  /* '=' */
+    { 0x00, 0x41, 0x22, 0x14, 0x08 },  /* '>' */
+    { 0x02, 0x01, 0x59, 0x09, 0x06 },  /* '?' */
+    { 0x3E, 0x41, 0x5D, 0x59, 0x4E },  /* '@' */
+    { 0x7C, 0x12, 0x11, 0x12, 0x7C },  /* 'A' */
+    { 0x7F, 0x49, 0x49, 0x49, 0x36 },  /* 'B' */
+    { 0x3E, 0x41, 0x41, 0x41, 0x22 },  /* 'C' */
+    { 0x7F, 0x41, 0x41, 0x41, 0x3E },  /* 'D' */
+    { 0x7F, 0x49, 0x49, 0x49, 0x41 },  /* 'E' */
+    { 0x7F, 0x09, 0x09, 0x09, 0x01 },  /* 'F' */
+    { 0x3E, 0x41, 0x41, 0x51, 0x73 },  /* 'G' */
+    { 0x7F, 0x08, 0x08, 0x08, 0x7F },  /* 'H' */
+    { 0x00, 0x41, 0x7F, 0x41, 0x00 },  /* 'I' */
+    { 0x20, 0x40, 0x41, 0x3F, 0x01 },  /* 'J' */
+    { 0x7F, 0x08, 0x14, 0x22, 0x41 },  /* 'K' */
+    { 0x7F, 0x40, 0x40, 0x40, 0x40 },  /* 'L' */
+    { 0x7F, 0x02, 0x1C, 0x02, 0x7F },  /* 'M' */
+    { 0x7F, 0x04, 0x08, 0x10, 0x7F },  /* 'N' */
+    { 0x3E, 0x41, 0x41, 0x41, 0x3E },  /* 'O' */
+    { 0x7F, 0x09, 0x09, 0x09, 0x06 },  /* 'P' */
+    { 0x3E, 0x41, 0x51, 0x21, 0x5E },  /* 'Q' */
+    { 0x7F, 0x09, 0x19, 0x29, 0x46 },  /* 'R' */
+    { 0x26, 0x49, 0x49, 0x49, 0x32 },  /* 'S' */
+    { 0x03, 0x01, 0x7F, 0x01, 0x03 },  /* 'T' */
+    { 0x3F, 0x40, 0x40, 0x40, 0x3F },  /* 'U' */
+    { 0x1F, 0x20, 0x40, 0x20, 0x1F },  /* 'V' */
+    { 0x3F, 0x40, 0x38, 0x40, 0x3F },  /* 'W' */
+    { 0x63, 0x14, 0x08, 0x14, 0x63 },  /* 'X' */
+    { 0x03, 0x04, 0x78, 0x04, 0x03 },  /* 'Y' */
+    { 0x61, 0x59, 0x49, 0x4D, 0x43 },  /* 'Z' */
+    { 0x00, 0x7F, 0x41, 0x41, 0x41 },  /* '[' */
+    { 0x02, 0x04, 0x08, 0x10, 0x20 },  /* '\' */
+    { 0x00, 0x41, 0x41, 0x41, 0x7F },  /* ']' */
+    { 0x04, 0x02, 0x01, 0x02, 0x04 },  /* '^' */
+    { 0x40, 0x40, 0x40, 0x40, 0x40 },  /* '_' */
+    { 0x00, 0x03, 0x07, 0x08, 0x00 },  /* '`' */
+    { 0x20, 0x54, 0x54, 0x78, 0x40 },  /* 'a' */
+    { 0x7F, 0x28, 0x44, 0x44, 0x38 },  /* 'b' */
+    { 0x38, 0x44, 0x44, 0x44, 0x28 },  /* 'c' */
+    { 0x38, 0x44, 0x44, 0x28, 0x7F },  /* 'd' */
+    { 0x38, 0x54, 0x54, 0x54, 0x18 },  /* 'e' */
+    { 0x00, 0x08, 0x7E, 0x09, 0x02 },  /* 'f' */
+    { 0x18, 0xA4, 0xA4, 0x9C, 0x78 },  /* 'g' */
+    { 0x7F, 0x08, 0x04, 0x04, 0x78 },  /* 'h' */
+    { 0x00, 0x44, 0x7D, 0x40, 0x00 },  /* 'i' */
+    { 0x20, 0x40, 0x40, 0x3D, 0x00 },  /* 'j' */
+    { 0x7F, 0x10, 0x28, 0x44, 0x00 },  /* 'k' */
+    { 0x00, 0x41, 0x7F, 0x40, 0x00 },  /* 'l' */
+    { 0x7C, 0x04, 0x78, 0x04, 0x78 },  /* 'm' */
+    { 0x7C, 0x08, 0x04, 0x04, 0x78 },  /* 'n' */
+    { 0x38, 0x44, 0x44, 0x44, 0x38 },  /* 'o' */
+    { 0xFC, 0x18, 0x24, 0x24, 0x18 },  /* 'p' */
+    { 0x18, 0x24, 0x24, 0x18, 0xFC },  /* 'q' */
+    { 0x7C, 0x08, 0x04, 0x04, 0x08 },  /* 'r' */
+    { 0x48, 0x54, 0x54, 0x54, 0x24 },  /* 's' */
+    { 0x04, 0x04, 0x3F, 0x44, 0x24 },  /* 't' */
+    { 0x3C, 0x40, 0x40, 0x20, 0x7C },  /* 'u' */
+    { 0x1C, 0x20, 0x40, 0x20, 0x1C },  /* 'v' */
+    { 0x3C, 0x40, 0x30, 0x40, 0x3C },  /* 'w' */
+    { 0x44, 0x28, 0x10, 0x28, 0x44 },  /* 'x' */
+    { 0x4C, 0x90, 0x90, 0x90, 0x7C },  /* 'y' */
+    { 0x44, 0x64, 0x54, 0x4C, 0x44 },  /* 'z' */
+    { 0x00, 0x08, 0x36, 0x41, 0x00 },  /* '{' */
+    { 0x00, 0x00, 0x77, 0x00, 0x00 },  /* '|' */
+    { 0x00, 0x41, 0x36, 0x08, 0x00 },  /* '}' */
+    { 0x02, 0x01, 0x02, 0x04, 0x02 },  /* '~' */
+};
+
+static void scr_clear(void) { memset(fb, 0, sizeof fb); }
+
+/* s at pixel (x, y), each font pixel scale x scale; characters are 6 x 8 font pixels */
+static void scr_text(int x, int y, int scale, int colour, const char *s)
+{
+    uint16_t c = (colour >> 8 & 0xFF) | (colour & 0xFF) << 8;
+    for (; *s; s++, x += 6 * scale) {
+        int ch = (unsigned char)*s;
+        const unsigned char *g = font5x7[ch < 0x20 || ch > 0x7E ? '?' - 0x20 : ch - 0x20];
+        for (int col = 0; col < 5; col++)
+            for (int row = 0; row < 8; row++)
+                if (g[col] >> row & 1)
+                    for (int dy = 0; dy < scale; dy++)
+                        for (int dx = 0; dx < scale; dx++) {
+                            int px = x + col * scale + dx, py = y + row * scale + dy;
+                            if (px >= 0 && px < 128 && py >= 0 && py < 128) fb[py * 128 + px] = c;
+                        }
+    }
+}
+
+/* send fb to the panel */
+static void scr_show(void)
+{
+    unsigned char cmd, w[4] = { 0, lcd_x0, 0, lcd_x0 + 127 };
+    cmd = 0x2A; lcd_send(0, &cmd, 1); lcd_send(1, w, 4);           /* CASET */
+    w[1] = lcd_y0; w[3] = lcd_y0 + 127;
+    cmd = 0x2B; lcd_send(0, &cmd, 1); lcd_send(1, w, 4);           /* RASET */
+    cmd = 0x2C; lcd_send(0, &cmd, 1); lcd_send(1, fb, sizeof fb);  /* RAMWR */
+}
+
+/* LP5562: enable, internal clock, all channels from their PWM registers, W (the backlight) to level */
+static int bl_init(int level)
+{
+    i2c_master_bus_config_t b = {
+        .i2c_port = -1, .sda_io_num = BL_SDA, .scl_io_num = BL_SCL, .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7, .flags.enable_internal_pullup = 1,
+    };
+    i2c_device_config_t c = { .dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = BL_ADDR, .scl_speed_hz = 400000 };
+    i2c_master_bus_handle_t bus;
+    i2c_master_dev_handle_t d;
+    if (i2c_new_master_bus(&b, &bus) != ESP_OK || i2c_master_bus_add_device(bus, &c, &d) != ESP_OK) return -1;
+    unsigned char w[][2] = { { 0x00, 0x40 }, { 0x08, 0x01 }, { 0x70, 0x00 }, { 0x0E, level } };
+    for (int i = 0; i < 4; i++) {
+        if (i2c_master_transmit(d, w[i], 2, 50) != ESP_OK) return -1;
+        if (i == 0) msleep(1);
+    }
+    return 0;
+}
+
+/* set up the screen and clear it; what it is, or NULL if there isn't one. *ok = 0 if the backlight didn't answer */
+static const char *scr_init(int *ok)
+{
+    static char what[48];
+    spi_bus_config_t b = {
+        .mosi_io_num = LCD_MOSI, .miso_io_num = -1, .sclk_io_num = LCD_SCLK,
+        .quadwp_io_num = -1, .quadhd_io_num = -1, .max_transfer_sz = sizeof fb,
+    };
+    if (spi_bus_initialize(LCD_HOST, &b, SPI_DMA_CH_AUTO) != ESP_OK) return NULL;
+    gpio_reset_pin(LCD_DC);
+    gpio_set_direction(LCD_DC, GPIO_MODE_OUTPUT);
+    gpio_reset_pin(LCD_RST);
+    gpio_set_direction(LCD_RST, GPIO_MODE_OUTPUT);
+    gpio_set_level(LCD_RST, 0);
+    msleep(10);
+    gpio_set_level(LCD_RST, 1);
+    msleep(120);
+
+    /* some GC9107s only answer slowly; an ST7735S answers at the first speed */
+    uint32_t id = lcd_id(8000000);
+    int st = (id & 0xFFFF) == 0x7683 || (id & 0xFFFF) == 0x897C, gc = (id & 0xFFFFFF) == 0x079100;
+    if (!st && !gc) {
+        id = lcd_id(100000);
+        gc = (id & 0xFFFFFF) == 0x079100;
+    }
+    spi_device_interface_config_t d = { .clock_speed_hz = 40000000, .spics_io_num = LCD_CS, .queue_size = 1 };
+    if (spi_bus_add_device(LCD_HOST, &d, &lcd) != ESP_OK) return NULL;
+    lcd_cmds(st ? st7735s_init : gc9107_init);
+    lcd_x0 = st ? 2 : 0;
+    lcd_y0 = st ? 3 : 32;
+    snprintf(what, sizeof what, "%s (id %06lx%s)", st ? "ST7735S" : "GC9107",
+             (unsigned long)(id & 0xFFFFFF), st || gc ? "" : ", not recognised");
+    scr_clear();
+    scr_show();
+    *ok = bl_init(BL_LEVEL) == 0 && (st || gc);
+    return what;
+}
 
 #else
 
@@ -273,6 +565,12 @@ static void tick_wait(int ms)
     if (tick_next.tv_nsec >= 1000000000L) { tick_next.tv_nsec -= 1000000000L; tick_next.tv_sec++; }
     clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &tick_next, NULL);
 }
+
+/* no screen on the Pi */
+static const char *scr_init(int *ok) { *ok = 0; return NULL; }
+static void scr_clear(void) {}
+static void scr_text(int x, int y, int scale, int colour, const char *s) { (void)x; (void)y; (void)scale; (void)colour; (void)s; }
+static void scr_show(void) {}
 
 #endif
 
@@ -494,7 +792,9 @@ static void help(void)
     "walk [cycles] [stride] [turn]   stand, then walk with the current gait; stride < 0 walks backwards,\n"
     "                          turn > 0 turns left (stride 0 turns on the spot); no cycles = until a key;\n"
     "                          a key stops (it finishes the step and brings the legs to centre), ctrl-c freezes\n"
-    "set [name value]          list or set walk parameters: gait step stride lift height");
+    "set [name value]          list or set walk parameters: gait step stride lift height\n"
+    "selftest                  the startup checks again (reads only, nothing moves): servos, battery,\n"
+    "                          temperature, errors, overload settings, positions, load; on the ATOM's screen too");
 }
 
 static int arg(char **tok, int i, int ntok, int dflt, int *ok)
@@ -725,6 +1025,183 @@ static int check_servos(void)
     else printf("servos %.1f..%.1f V, %d..%d C\n", vmin / 10.0, vmax / 10.0, tmin, tmax);
     flush_status();         /* now, not after the command: an overload matters before moving */
     return bad ? -1 : 0;
+}
+
+/*
+ * The self test, at startup and by the selftest command. It only reads, so
+ * nothing moves. Each check logs a line on the console and a short one (10
+ * characters) on the ATOM's screen as it goes; then the screen says Hi!, in
+ * green, yellow if there were warnings, red if anything failed, with the
+ * problems under it.
+ */
+#define REG_UNLOAD        0x13  /* unloading conditions: bit 5 = overload protection */
+#define REG_PROT_TORQUE   0x25  /* then 0x26 protection time (40 ms units), 0x27 overload torque (%) */
+#define BATT_LOW  70            /* 2S, 0.1 V */
+#define BATT_FLAT 66
+#define BATT_HIGH 85
+
+enum { T_OK, T_WARN, T_FAIL };
+static const int t_colour[] = { 0x07E0, 0xFFE0, 0xF800 };     /* RGB565 green, yellow, red */
+#define T_ROWS 8                                              /* 16-pixel lines on the screen */
+struct t_line { char s[11]; int level; };
+static struct t_line t_log[T_ROWS], t_bad[T_ROWS];
+static int t_nlog, t_nbad, t_worst;
+static const char *scr_what;                                  /* from scr_init(); NULL with no screen */
+static int scr_ok;
+
+static void t_draw(const struct t_line *l, int n, int y)
+{
+    for (int i = 0; i < n; i++) scr_text(4, y + 16 * i, 2, t_colour[l[i].level], l[i].s);
+}
+
+static void t_line(int level, const char *scr, const char *fmt, ...)
+{
+    va_list ap;
+    printf("%s  ", (const char *[]){ "ok  ", "warn", "FAIL" }[level]);
+    va_start(ap, fmt); vprintf(fmt, ap); va_end(ap);
+    putchar('\n');
+    fflush(stdout);
+    if (level > t_worst) t_worst = level;
+    if (t_nlog == T_ROWS) memmove(t_log, t_log + 1, --t_nlog * sizeof *t_log);
+    struct t_line *l = &t_log[t_nlog++];
+    snprintf(l->s, sizeof l->s, "%s", scr);
+    l->level = level;
+    if (level != T_OK && t_nbad < T_ROWS) t_bad[t_nbad++] = *l;
+    if (!scr_what) return;
+    scr_clear();
+    t_draw(t_log, t_nlog, 0);
+    scr_show();
+    msleep(250);                        /* to be seen going by */
+}
+
+/* "1,7,12" from the ids flagged in bad[12] (indexed like check_servos) */
+static const char *t_ids(const int *bad)
+{
+    static char s[48];
+    int n = 0;
+    s[0] = 0;
+    for (int i = 0; i < 12; i++)
+        if (bad[i]) n += snprintf(s + n, sizeof s - n, "%s%d", n ? "," : "", i < 6 ? legs[i].hip : legs[i - 6].lift);
+    return s;
+}
+
+static int selftest(void)
+{
+    int volt[12], temp[12], pos[12], miss[12] = {0}, nmiss = 0;
+    unsigned char err[12] = {0};
+    t_nlog = t_nbad = t_worst = 0;
+
+    if (scr_what) t_line(scr_ok ? T_OK : T_WARN, scr_ok ? "screen" : "screen?", "screen: %s%s", scr_what,
+                         scr_ok ? "" : "; the backlight (LP5562) didn't answer or the panel wasn't recognised");
+
+    /* every servo replies (quietly: a missing battery would print 12 "no reply"s) */
+    for (int i = 0; i < 12; i++) {
+        int id = i < 6 ? legs[i].hip : legs[i - 6].lift;
+        unsigned char b[2], e = 0;
+        if (txrx(id, INST_READ, (unsigned char[]){ REG_VOLTAGE, 2 }, 2, &e, b, 2) != 2) { miss[i] = 1; nmiss++; continue; }
+        volt[i] = b[0];
+        temp[i] = b[1];
+        err[i] |= e;
+    }
+    if (nmiss == 12) {
+        t_line(T_FAIL, "no servos", "no servo replied: battery off, or the bus not connected?");
+        goto done;
+    }
+    if (nmiss) {
+        char s[64];
+        snprintf(s, sizeof s, "no %s", t_ids(miss));
+        t_line(T_FAIL, s, "no reply from servo(s) %s", t_ids(miss));
+    }
+    else t_line(T_OK, "servos 12", "all 12 servos reply");
+
+    /* the battery, as the servos see it */
+    int vmin = 255, vmax = 0, tmin = 255, tmax = 0;
+    for (int i = 0; i < 12; i++) {
+        if (miss[i]) continue;
+        if (volt[i] < vmin) vmin = volt[i];
+        if (volt[i] > vmax) vmax = volt[i];
+        if (temp[i] < tmin) tmin = temp[i];
+        if (temp[i] > tmax) tmax = temp[i];
+    }
+    char s[64];
+    snprintf(s, sizeof s, "batt %.1fV", vmin / 10.0);
+    t_line(vmin < BATT_FLAT ? T_FAIL : vmin < BATT_LOW || vmax > BATT_HIGH ? T_WARN : T_OK, s,
+           "battery %.1f V (servos read %.1f..%.1f)%s", vmin / 10.0, vmin / 10.0, vmax / 10.0,
+           vmin < BATT_FLAT ? ": flat, charge it" : vmin < BATT_LOW ? ": low" : vmax > BATT_HIGH ? ": high for a 2S" : "");
+
+    snprintf(s, sizeof s, "temp %dC", tmax);
+    t_line(tmax >= 60 ? T_FAIL : tmax >= 50 ? T_WARN : T_OK, s, "servo temperatures %d..%d C", tmin, tmax);
+
+    /* error bits in the replies (overload, overheat, ...) */
+    int nerr = 0;
+    for (int i = 0; i < 12; i++) {
+        if (!err[i]) continue;
+        int id = i < 6 ? legs[i].hip : legs[i - 6].lift;
+        static const char *const bitname[8] = { "volt", "angle", "heat", "amps", "?", "load", "?", "?" };
+        int bit = 0;
+        while (!(err[i] >> bit & 1)) bit++;
+        snprintf(s, sizeof s, "%d %s", id, bitname[bit]);
+        t_line(T_FAIL, s, "servo %d reports %s", id, errstr(err[i]));
+        nerr++;
+    }
+    if (!nerr) t_line(T_OK, "no errors", "no servo reports an error");
+
+    /* overload protection at the defaults: over 80% for 4 s drops to 20% */
+    int prot[12] = {0}, nprot = 0;
+    for (int i = 0; i < 12; i++) {
+        int id = i < 6 ? legs[i].hip : legs[i - 6].lift;
+        unsigned char p[3], u, e;
+        if (miss[i]) continue;
+        if (txrx(id, INST_READ, (unsigned char[]){ REG_PROT_TORQUE, 3 }, 2, &e, p, 3) != 3 ||
+            txrx(id, INST_READ, (unsigned char[]){ REG_UNLOAD, 1 }, 2, &e, &u, 1) != 1) { prot[i] = 1; nprot++; continue; }
+        if (p[0] != 20 || p[1] != 100 || p[2] != 80 || u != 0x20) {
+            printf("      servo %d: overload torque %d%%, time %d ms, protection torque %d%%, unloading 0x%02X\n",
+                   id, p[2], p[1] * 40, p[0], u);
+            prot[i] = 1;
+            nprot++;
+        }
+    }
+    if (nprot) {
+        snprintf(s, sizeof s, "prot %s", t_ids(prot));
+        t_line(T_WARN, s, "overload protection not at the defaults (or unreadable) on servo(s) %s", t_ids(prot));
+    }
+    else t_line(T_OK, "prot ok", "overload protection at the defaults (over 80%% for 4 s drops to 20%%)");
+
+    /* positions: inside the range the legs are driven over */
+    int far[12] = {0}, nfar = 0, lmax = 0;
+    for (int i = 0; i < 12; i++) {
+        const struct leg *L = &legs[i % 6];
+        int id = i < 6 ? L->hip : L->lift;
+        unsigned char b[2], e;
+        if (miss[i]) continue;
+        if (txrx(id, INST_READ, (unsigned char[]){ REG_PRESENT_POS, 2 }, 2, &e, b, 2) != 2) { far[i] = 1; nfar++; continue; }
+        pos[i] = get16(b) - CENTRE - offset[id];
+        if (i < 6 ? abs(pos[i]) > HIP_MAX + 10 : L->lift_dir * pos[i] < -DOWN_MAX - 10) { far[i] = 1; nfar++; }
+        if (txrx(id, INST_READ, (unsigned char[]){ REG_PRESENT_LOAD, 2 }, 2, &e, b, 2) == 2 && (get16(b) & 0x3FF) > lmax)
+            lmax = get16(b) & 0x3FF;
+    }
+    if (nfar) {
+        snprintf(s, sizeof s, "pos %s", t_ids(far));
+        t_line(T_WARN, s, "servo(s) %s outside the range the legs are driven over (hips +-%d, lifts down to %d); stand will move them a long way",
+               t_ids(far), HIP_MAX, DOWN_MAX);
+    }
+    else t_line(T_OK, "pos ok", "every servo inside the range the legs are driven over");
+
+    /* standing still is when overload protection bites */
+    snprintf(s, sizeof s, "load %d%%", lmax / 10);
+    t_line(lmax >= 800 ? T_FAIL : lmax >= 500 ? T_WARN : T_OK, s, "highest load %.1f%% (overload protection starts at 80%% held for 4 s)", lmax / 10.0);
+
+done:
+    printf("self test: %s\n", t_worst == T_OK ? "all ok" : t_worst == T_WARN ? "warnings" : "problems");
+    if (scr_what) {
+        msleep(1000);
+        scr_clear();
+        int y = t_nbad ? 8 : 46;
+        scr_text(21, y, 5, t_colour[t_worst], "Hi!");
+        t_draw(t_bad, t_nbad < 4 ? t_nbad : 4, 56);
+        scr_show();
+    }
+    return t_worst;
 }
 
 /* all feet down, hips centred, taking ms */
@@ -1112,6 +1589,7 @@ static int run(char **tok, int nt)
         }
         walk(cycles, str, turn);
     }
+    else if (!strcmp(c, "selftest")) selftest();
     else if (!strcmp(c, "set")) {
         const struct param *p = NULL;
         for (int i = 0; nt > 1 && i < (int)(sizeof params / sizeof *params); i++)
@@ -1283,8 +1761,11 @@ void app_main(void)
 {
     con_init();
     open_port(NULL, 1000000);
+    scr_what = scr_init(&scr_ok);
+    printf("hector on the ATOM: bus on UART1 (TX G38, RX G39) @ 1000000\n");
+    selftest();
     for (;;) {
-        printf("hector on the ATOM: bus on UART1 (TX G38, RX G39) @ 1000000 (type help)\n");
+        printf("type help\n");
         repl();
         puts("nothing to quit to on the ATOM");
     }
@@ -1296,7 +1777,10 @@ int main(int argc, char **argv)
     int baud = argc > 2 ? atoi(argv[2]) : 1000000;
     con_init();
     open_port(dev, baud);
-    printf("opened %s @ %d (type help)\n", dev, baud);
+    printf("opened %s @ %d\n", dev, baud);
+    scr_what = scr_init(&scr_ok);
+    selftest();
+    printf("type help\n");
     repl();
     close(fd);
     return 0;

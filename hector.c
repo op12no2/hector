@@ -1010,10 +1010,14 @@ static void print_offsets(void)
 }
 
 /*
- * The legs. Hips (yaw) are ids 1-6 and lifts 7-12; side and row say where each
- * leg is, which is all the gaits need. hip_dir is +1 if a higher position swings
- * the foot forward (towards the head), lift_dir +1 if a higher position raises
- * the foot; legtest shows both.
+ * The legs. Hips (yaw) are ids 1-6 and lifts 7-12; leg n is hip n + lift n+6,
+ * and legs 1-6 go clockwise round the body seen from above. Walking forward is
+ * towards the gap between legs 6 and 1 (legtest 1 swings leg 1 towards 6), so
+ * 1-3 are the right side front to back and 6-4 the left. side and row say
+ * where each leg is, which is all the gaits need. hip_dir is +1 if a higher
+ * position swings the foot forward (a higher position turns every hip
+ * clockwise seen from above), lift_dir +1 if a higher position raises the
+ * foot; legtest shows both.
  */
 static struct leg {
     int side, row;              /* side 0 left, 1 right; row 0 front, 1 middle, 2 rear */
@@ -1022,12 +1026,12 @@ static struct leg {
     double x, z;                /* hip swing (+ forward) and foot lift (+ up) from the stance pose, steps */
 } legs[6] = {
     /* side row hip lift hip_dir lift_dir x z */
-    { 0, 0, 1,  7, -1, 1, 0, 0 },     /* LF */
-    { 0, 1, 2,  8, -1, 1, 0, 0 },     /* LM */
-    { 0, 2, 3,  9, -1, 1, 0, 0 },     /* LR */
-    { 1, 0, 4, 10,  1, 1, 0, 0 },     /* RF */
-    { 1, 1, 5, 11,  1, 1, 0, 0 },     /* RM */
-    { 1, 2, 6, 12,  1, 1, 0, 0 },     /* RR */
+    { 1, 0, 1,  7, -1, 1, 0, 0 },     /* RF */
+    { 1, 1, 2,  8, -1, 1, 0, 0 },     /* RM */
+    { 1, 2, 3,  9, -1, 1, 0, 0 },     /* RR */
+    { 0, 2, 4, 10,  1, 1, 0, 0 },     /* LR */
+    { 0, 1, 5, 11,  1, 1, 0, 0 },     /* LM */
+    { 0, 0, 6, 12,  1, 1, 0, 0 },     /* LF */
 };
 
 /*
@@ -1041,7 +1045,7 @@ static const struct gait {
 } gaits[] = {
     { "wave",   1 / 6.0, { { 5 / 6.0, 4 / 6.0, 3 / 6.0 }, { 2 / 6.0, 1 / 6.0, 0 } } },       /* 1 leg up at a time, back to front, right then left */
     { "ripple", 1 / 3.0, { { 2 / 3.0, 1 / 3.0, 0 }, { 1 / 6.0, 5 / 6.0, 1 / 2.0 } } },       /* 2 up: each side back to front, sides half a cycle apart */
-    { "tripod", 1 / 2.0, { { 0, 1 / 2.0, 0 }, { 1 / 2.0, 0, 1 / 2.0 } } },                   /* 3 up: LF+RM+LR, then RF+LM+RR */
+    { "tripod", 1 / 2.0, { { 0, 1 / 2.0, 0 }, { 1 / 2.0, 0, 1 / 2.0 } } },                   /* 3 up: LF+RM+LR (6, 2, 4), then RF+LM+RR (1, 5, 3) */
 };
 
 /* walk parameters (the set command) */

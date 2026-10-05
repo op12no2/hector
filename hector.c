@@ -989,7 +989,7 @@ static void verify_move(const int *ids, int nid, const int *goal, int tm)
  * The offset and calibrate commands change it until exit; paste what they
  * print here to keep it.
  */
-static int offset[254] = { [7] = 4, [8] = -7, [9] = 3, [10] = -23, [11] = 5, [12] = -25 };
+static int offset[254] = { [7] = 4, [8] = -7, [9] = 2, [10] = -26, [11] = 9, [12] = -25 };
 
 /* the offset table as a line of C, to paste above */
 static void print_offsets(void)

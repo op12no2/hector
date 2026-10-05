@@ -463,11 +463,16 @@ static const char *scr_init(int *ok)
 /*
  * The IMU: a Bosch BMI270 (accelerometer and gyro) at 0x68 on the internal
  * I2C. It needs Bosch's 8 KB configuration file uploaded at every start-up.
- * Accelerometer +-4 g at 100 Hz, gyro +-500 deg/s at 200 Hz. As the ATOM is
- * mounted, the chip's axes are the robot's: +x forward, +y left, +z up
- * (found by tipping it up at each edge).
+ * Accelerometer +-4 g at 100 Hz, gyro +-500 deg/s at 200 Hz. imu_read()
+ * turns the readings into the robot's axes: +x towards the gap between legs
+ * 1 and 2, +y 90 degrees anticlockwise from that (seen from above), +z up.
+ * Legs 1-6 (hip ids) go clockwise round the body, so leg k points at
+ * 30 - 60 (k - 1) degrees. The ATOM lies flat on the leg 1-4 axis, the
+ * chip's +x pointing at leg 4, IMU_YAW (found by tipping the robot up at
+ * each gap between legs).
  */
 #define IMU_ADDR 0x68
+#define IMU_YAW  -150.0         /* deg, anticlockwise from the 1-2 gap: where the chip's +x points */
 #include "atom/bmi270_config.h"
 
 static i2c_master_dev_handle_t imu;
@@ -513,15 +518,18 @@ static int imu_init(void)
     return 0;
 }
 
-/* acceleration in g (+1 on z standing level) and rotation in deg/s: x forward, y left, z up */
+/* acceleration in g (+1 on z standing level) and rotation in deg/s, in the robot's axes: x forward, y left, z up */
 static int imu_read(double acc[3], double gyr[3])
 {
     unsigned char b[12];
-    if (!imu || imu_rd(0x0C, b, 12)) return -1;  /* ACC x y z, GYR x y z, little-endian */
+    double a[3], g[3], c = cos(IMU_YAW * M_PI / 180), s = sin(IMU_YAW * M_PI / 180);
+    if (!imu || imu_rd(0x0C, b, 12)) return -1;  /* ACC x y z, GYR x y z, little-endian, chip axes */
     for (int i = 0; i < 3; i++) {
-        acc[i] = (int16_t)(b[2 * i] | b[2 * i + 1] << 8) * 4.0 / 32768;
-        gyr[i] = (int16_t)(b[6 + 2 * i] | b[7 + 2 * i] << 8) * 500.0 / 32768;
+        a[i] = (int16_t)(b[2 * i] | b[2 * i + 1] << 8) * 4.0 / 32768;
+        g[i] = (int16_t)(b[6 + 2 * i] | b[7 + 2 * i] << 8) * 500.0 / 32768;
     }
+    acc[0] = c * a[0] - s * a[1]; acc[1] = s * a[0] + c * a[1]; acc[2] = a[2];
+    gyr[0] = c * g[0] - s * g[1]; gyr[1] = s * g[0] + c * g[1]; gyr[2] = g[2];
     return 0;
 }
 
@@ -1119,7 +1127,7 @@ static int check_servos(void)
 #define REG_PROT_TORQUE   0x25  /* then 0x26 protection time (40 ms units), 0x27 overload torque (%) */
 #define BATT_LOW  70            /* 2S, 0.1 V */
 #define BATT_FLAT 66
-#define BATT_HIGH 85
+#define BATT_HIGH 87            /* a full 2S reads up to 8.6 on some servos */
 
 enum { T_OK, T_WARN, T_FAIL };
 static const int t_colour[] = { 0x07E0, 0xFFE0, 0xF800 };     /* RGB565 green, yellow, red */
@@ -1380,19 +1388,23 @@ static void imu_stream(int secs)
  * Tip it up at an edge and put it down: it bows towards that edge and comes
  * back up. Stands, takes the IMU's reading as level, then at 50 Hz: a tilt of
  * over BOW_TIP_ON degrees from level is a tip, and its direction at the
- * biggest tilt is kept; once it has been back under BOW_TIP_OFF for
+ * biggest tilt is kept, counting only samples where the total acceleration is
+ * within BOW_STILL of what it was level (putting it down jolts it, with
+ * spikes bigger than the tilt, any way); once it has been back under BOW_TIP_OFF for
  * BOW_SETTLE_MS (put down and still), it bows: the lifts of the two legs
- * nearest that way (from where the hips are: 60 degrees apart, the middle
- * legs straight out) go up to BOW_POS over BOW_MS, the same as
- * "move 7-8 700 1000" for the left front pair, so that edge of the body
- * comes down onto the ground (it's designed to land safely), then it
- * stands, and re-takes level. Until a key, or secs seconds.
+ * either side of that way (leg k, hip id k, points at 30 - 60 (k - 1)
+ * degrees in imu_read()'s axes: the legs go clockwise from the 1-2 gap) go
+ * to BOW_POS over BOW_MS (as "move 7-8 700 1000" for legs 1 and 2), so that
+ * edge of the body comes down (it's designed to land safely); it holds
+ * BOW_HOLD_MS, stands, and re-takes level. Until a key, or secs seconds.
  */
 #define BOW_TIP_ON    3.0     /* deg */
 #define BOW_TIP_OFF   1.5
 #define BOW_SETTLE_MS 300
+#define BOW_STILL     0.05    /* g */
 #define BOW_POS       700     /* the near lifts' position, as move's (the offset is added) */
 #define BOW_MS        1000    /* to get there, and to stand again */
+#define BOW_HOLD_MS   500     /* bowed, before standing */
 
 /* the IMU's acceleration averaged over ms, as the level reference */
 static int bow_level(double a0[3], int ms)
@@ -1409,12 +1421,8 @@ static int bow_level(double a0[3], int ms)
     return 0;
 }
 
-static const char *bow_dir_name(double ang)
-{
-    static const char *const nm[8] = { "front", "front L", "left", "rear L", "rear", "rear R", "right", "front R" };
-    int k = (int)lround(ang / (M_PI / 4));
-    return nm[((k % 8) + 8) % 8];
-}
+/* where leg (hip id) k points, radians, in imu_read()'s axes */
+static double leg_ang(int k) { return (30 - 60 * (k - 1)) * M_PI / 180; }
 
 static void bow_screen(const char *s, int colour)
 {
@@ -1450,29 +1458,31 @@ static void bow(int secs)
             if (tilt > BOW_TIP_ON) { state = 1; peak = 0; settle = 0; bow_screen("...", 0xFFE0); }
             continue;
         }
-        if (tilt > peak) { peak = tilt; pang = atan2(dy, dx); }
+        double na = sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]), n0 = sqrt(a0[0] * a0[0] + a0[1] * a0[1] + a0[2] * a0[2]);
+        if (tilt > peak && fabs(na - n0) < BOW_STILL) { peak = tilt; pang = atan2(dy, dx); }
         settle = tilt < BOW_TIP_OFF ? settle + TICK_MS : 0;
         if (settle < BOW_SETTLE_MS) continue;
+        if (peak < BOW_TIP_ON) { state = 0; bow_screen("tip me", 0x07E0); continue; }     /* only jolts: not a tip */
 
-        bow_screen(bow_dir_name(pang), 0x07E0);
         /* the two legs pointing most nearly that way */
         double c[6];
         int n1 = 0, n2 = 1;
-        for (int i = 0; i < 6; i++) {
-            const double lx[3] = { 0.866, 0, -0.866 }, ly[3] = { 0.5, 1, 0.5 };
-            c[i] = lx[legs[i].row] * cos(pang) + (legs[i].side ? -1 : 1) * ly[legs[i].row] * sin(pang);
-        }
+        for (int i = 0; i < 6; i++) c[i] = cos(leg_ang(legs[i].hip) - pang);
         for (int i = 0; i < 6; i++) if (c[i] > c[n1]) n1 = i;
         if (n2 == n1) n2 = 0;
         for (int i = 0; i < 6; i++) if (i != n1 && c[i] > c[n2]) n2 = i;
-        printf("tipped %s, %.1f deg: bowing on %s", bow_dir_name(pang), peak, leg_name(&legs[n1]));
-        printf(" and %s\n", leg_name(&legs[n2]));         /* leg_name's buffer is static */
+        int lo = legs[n1].hip < legs[n2].hip ? n1 : n2, hi = lo == n1 ? n2 : n1;
+        char s[16];
+        snprintf(s, sizeof s, "legs %d+%d", legs[lo].hip, legs[hi].hip);
+        printf("tipped %.1f deg towards %.0f deg: bowing on %s (lifts %d, %d)\n", peak, pang * 180 / M_PI, s,
+               legs[lo].lift, legs[hi].lift);
         fflush(stdout);
+        bow_screen(s, 0x07E0);
         /* z for a lift position of BOW_POS + offset, as leg_goals() works it out */
         legs[n1].z = height + legs[n1].lift_dir * (BOW_POS - CENTRE);
         legs[n2].z = height + legs[n2].lift_dir * (BOW_POS - CENTRE);
         send_pose(BOW_MS);
-        msleep(BOW_MS + 200);
+        msleep(BOW_MS + BOW_HOLD_MS);
         if (halted || stand(BOW_MS)) break;
         if (bow_level(a0, 300)) { puts("IMU read failed"); break; }
         bow_screen("tip me", 0x07E0);

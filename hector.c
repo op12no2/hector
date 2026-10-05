@@ -892,6 +892,7 @@ static void help(void)
     "\n"
     "hexapod (leg n: hip id n, lift id n+6; layout and directions in legs[] in hector.c):\n"
     "stand [ms]                all feet down, hips centred, taking ms (default 1000)\n"
+    "front [1-6]               show or set the walk's front: gap k, between legs k and k+1 (a bow sets it too)\n"
     "sit [ms]                  all lifts up to 1000, taking ms (default 1000): the body sits on the ground with the\n"
     "                          legs up inside it, no load on the servos; for switching off. stand gets up again\n"
     "legtest [1-6]             each leg in turn (or one, by hip id): up to 700, forward 80, back, down; the others stay put\n"
@@ -1057,6 +1058,32 @@ static struct leg {
     { 0, 1, 5, 11,  1, 1, 0, 0 },     /* LM */
     { 0, 0, 6, 12,  1, 1, 0, 0 },     /* LF */
 };
+
+/*
+ * The front: any of the six gaps between legs can be the front, as the legs
+ * are 60 degrees apart and all fitted the same way, so each choice is as good
+ * a gait as the others. Gap k is the one between legs k and k+1 (6 and 1 for
+ * gap 6), at -60 (k - 1) degrees in imu_read()'s axes. Going clockwise from
+ * the front gap, the next three legs are the right side, front to back, and
+ * going anticlockwise the other three are the left. A higher hip position
+ * turns every hip clockwise seen from above, which swings a right leg's foot
+ * back and a left leg's forward, so hip_dir is -1 on the right, +1 on the
+ * left. legs[] above is gap 6; set_front() redoes side, row and hip_dir.
+ */
+static int front = 6;
+
+static double gap_ang(int k) { return -60 * (k - 1) * M_PI / 180; }
+
+static void set_front(int k)
+{
+    front = k;
+    for (int i = 0; i < 6; i++) {
+        int p = ((legs[i].hip - (k % 6 + 1)) % 6 + 6) % 6;    /* 0-5 clockwise from the leg after the gap */
+        legs[i].side = p < 3;                                   /* 1 right, 0 left */
+        legs[i].row = p < 3 ? p : 5 - p;
+        legs[i].hip_dir = p < 3 ? -1 : 1;
+    }
+}
 
 /*
  * Gaits: each leg is in the air for `swing` of the cycle, starting at its
@@ -1987,6 +2014,16 @@ static int run(char **tok, int nt)
     else if (!strcmp(c, "loads")) loads(arg(tok, 1, nt, 10, NULL));
     else if (!strcmp(c, "imu")) imu_stream(arg(tok, 1, nt, 10, NULL));
     else if (!strcmp(c, "sit")) sit(arg(tok, 1, nt, 1000, NULL));
+    else if (!strcmp(c, "front")) {
+        int k = arg(tok, 1, nt, front, NULL);
+        if (k < 1 || k > 6) { puts("front: 1-6, the gap between legs k and k+1"); return 0; }
+        set_front(k);
+        printf("front: gap %d, between legs %d and %d; right side", k, k, k % 6 + 1);
+        for (int r = 0; r < 3; r++) for (int i = 0; i < 6; i++) if (legs[i].side == 1 && legs[i].row == r) printf(" %d", legs[i].hip);
+        printf(", left side");
+        for (int r = 0; r < 3; r++) for (int i = 0; i < 6; i++) if (legs[i].side == 0 && legs[i].row == r) printf(" %d", legs[i].hip);
+        printf(" (front to back)\n");
+    }
     else if (!strcmp(c, "set")) {
         const struct param *p = NULL;
         for (int i = 0; nt > 1 && i < (int)(sizeof params / sizeof *params); i++)
@@ -2062,16 +2099,22 @@ static int dispatch(char **tok, int nt)
 /*
  * ---- alive ----
  * What runs while the REPL waits for a key: alive() every ALIVE_MS. For now
- * the eyes on the ATOM's screen: they blink every few seconds (sometimes
- * twice; the lid comes down from the top), glance about now and then, and
- * look towards look_ang when look_on is set (radians in imu_read()'s axes).
- * The screen's top points at leg 1 (+30 degrees), so its right is at -60.
- * The whites are white, yellow or red after the self test's result, with its
- * first problem under them.
+ * the face on the ATOM's screen: two eyes and a mouth, drawn turned so that
+ * its mouth points at the walk's front (someone standing there sees it
+ * upright, looking at them); when the front changes it turns there over about
+ * half a second, the short way round. The eyes blink every few seconds
+ * (sometimes twice; the lid comes down from the top) and glance about now and
+ * then. The screen's top points at leg 1 (+30 degrees in imu_read()'s axes),
+ * its right at -60. Every pixel is turned back into the face's own frame and
+ * drawn from there, so the face stays inside the screen's inner circle. The
+ * whites are white, yellow or red after the current status, which is written
+ * upright along the bottom, and the mouth shows it too: a smile when all's
+ * well, flat for a warning, a frown for a failure (mood, +1 to -1,
+ * eased so it changes visibly).
  */
 #define ALIVE_MS 20
-#define EYE_X    31             /* each eye's centre, from the screen's middle */
-#define EYE_Y    58
+#define EYE_X    31             /* each eye's centre, from the face's middle */
+#define EYE_Y    -8
 #define EYE_RX   30             /* the whites: almond-shaped, pointed at the corners */
 #define EYE_UP   25             /* the top lid's curve above the centre, at the middle */
 #define EYE_DOWN 19             /* the bottom lid's, below */
@@ -2080,9 +2123,12 @@ static int dispatch(char **tok, int nt)
 #define LOOK_X   10             /* how far the irises move: across, up and down */
 #define LOOK_Y   4
 #define IRIS_COLOUR 0x2D5F      /* RGB565: a bright blue */
+#define MOUTH_Y  25             /* the mouth's corners, below the face's middle */
+#define MOUTH_W  22             /* half its width */
+#define MOUTH_CURVE 8           /* how far its middle drops below the corners at mood +1 (rises at -1) */
+#define MOUTH_T  4              /* its thickness */
+#define MOUTH_AT_FRONT 1        /* 0: the face's top points at the front instead */
 
-static double look_ang;
-static int look_on;
 static int eyes_dirty = 1;      /* redraw: something else used the screen */
 
 /* the servo watch's state (watch(), below): per servo, and the worst problem now */
@@ -2094,7 +2140,7 @@ static double frand(double lo, double hi) { return lo + (hi - lo) * rand() / (do
 
 static void eyes(void)
 {
-    static double next_blink, blink_t0 = -1, next_glance, glance_until, gx, gy, cx, cy;
+    static double next_blink, blink_t0 = -1, next_glance, glance_until, gx, gy, cx, cy, beta = 99;
     static int last_open = -1, last_px = 999, last_py = 999;
     double t = now();
     if (!next_blink) { next_blink = t + frand(2, 5); next_glance = t + frand(4, 9); }
@@ -2115,14 +2161,16 @@ static void eyes(void)
         glance_until = t + frand(0.6, 1.8);
         next_glance = t + frand(4, 10);
     }
-    double tx = 0, ty = 0;                      /* where the pupils are heading: screen right, down */
-    if (t < glance_until) { tx = gx; ty = gy; }
-    else if (look_on) {
-        tx = cos(look_ang - -60 * M_PI / 180);
-        ty = -cos(look_ang - 30 * M_PI / 180);
-    }
+    double tx = t < glance_until ? gx : 0, ty = t < glance_until ? gy : 0;
     cx += (tx - cx) * 0.25;
     cy += (ty - cy) * 0.25;
+
+    /* the head: turn so the mouth points at the front, the short way round */
+    double f = gap_ang(front), r = -60 * M_PI / 180, u = 30 * M_PI / 180;
+    double target = atan2(-cos(f - r), -cos(f - u)) + (MOUTH_AT_FRONT ? 0 : M_PI);
+    if (beta > 50) beta = target;
+    double d = remainder(target - beta, 2 * M_PI);
+    if (fabs(d) > 0.003) { beta += fabs(d) < 0.02 ? d : d * 0.15; eyes_dirty = 1; }
 
     /* the status: the self test's for a while after it, then the watch's */
     int level = w_level;
@@ -2137,26 +2185,41 @@ static void eyes(void)
     }
     static const int white[] = { 0xFFFF, 0xFFE0, 0xF800 };
 
+    /* the mood: a smile, flat, or a frown, after the status */
+    static double mood = 1;
+    double want = level == T_OK ? 1 : level == T_WARN ? 0 : -1;
+    if (fabs(want - mood) > 0.01) { mood += fabs(want - mood) < 0.05 ? want - mood : (want - mood) * 0.1; eyes_dirty = 1; }
+
     int lid = (int)lround((EYE_UP + EYE_DOWN) * (1 - open)), px = (int)lround(cx * LOOK_X), py = (int)lround(cy * LOOK_Y);
     if (!eyes_dirty && lid == last_open && px == last_px && py == last_py) return;
     eyes_dirty = 0; last_open = lid; last_px = px; last_py = py;
 
-    scr_clear();
-    for (int side = -1; side <= 1; side += 2) {
-        int ex = 64 + side * EYE_X;
-        for (int x = -EYE_RX; x <= EYE_RX; x++) {
-            double u = (double)x / EYE_RX, k = 1 - u * u;          /* parabolas: pointed where they meet */
-            int top = -(int)lround(EYE_UP * k), bottom = (int)lround(EYE_DOWN * k);
-            if (top < -EYE_UP + lid) top = -EYE_UP + lid;           /* the lid, down from the top */
-            for (int y = top; y <= bottom; y++) {
-                int dx = x - px, dy = y - py, r2 = dx * dx + dy * dy, c = white[level];
-                if ((x + 7) * (x + 7) + (y + 8) * (y + 8) <= 16) c = 0xFFFF;   /* the highlight stays put */
-                else if (r2 <= PUPIL_R * PUPIL_R) c = 0x0000;
-                else if (r2 <= IRIS_R * IRIS_R) c = IRIS_COLOUR;
-                scr_pixel(ex + x, EYE_Y + y, c);
+    float c = cosf(beta), s = sinf(beta);
+    for (int sy = 0; sy < 128; sy++)
+        for (int sx = 0; sx < 128; sx++) {
+            int col = 0x0000;
+            if (*text && sy >= 104) { scr_pixel(sx, sy, col); continue; }      /* the status strip */
+            float X = sx - 63.5f, Y = sy - 63.5f;
+            float fx = c * X + s * Y, fy = -s * X + c * Y;                     /* the face's own frame */
+            for (int side = -1; side <= 1; side += 2) {
+                float x = fx - side * EYE_X, y = fy - EYE_Y;
+                if (x < -EYE_RX || x > EYE_RX) continue;
+                float k = 1 - (x / EYE_RX) * (x / EYE_RX);                     /* parabolas: pointed where they meet */
+                float top = -EYE_UP * k, lidtop = -EYE_UP + lid;
+                if (y < (top > lidtop ? top : lidtop) || y > EYE_DOWN * k) continue;
+                float dx = x - px, dy = y - py, r2 = dx * dx + dy * dy;
+                col = white[level];
+                if ((x + 7) * (x + 7) + (y + 8) * (y + 8) <= 16) col = 0xFFFF;   /* the highlight stays put */
+                else if (r2 <= PUPIL_R * PUPIL_R) col = 0x0000;
+                else if (r2 <= IRIS_R * IRIS_R) col = IRIS_COLOUR;
             }
+            float ax = fabsf(fx);
+            if (ax <= MOUTH_W) {                                               /* the mouth: a parabola */
+                float yc = MOUTH_Y + MOUTH_CURVE * (float)mood * (1 - (ax / MOUTH_W) * (ax / MOUTH_W));
+                if (fabsf(fy - yc) <= MOUTH_T / 2.0f) col = white[level];
+            }
+            scr_pixel(sx, sy, col);
         }
-    }
     if (*text) scr_text(4, 108, 2, t_colour[level], text);
     scr_show();
 }
@@ -2270,6 +2333,16 @@ static int watch(void)
     return printed;
 }
 
+/* wait ms, keeping the face going (it turns while the legs move) */
+static void face_wait(int ms)
+{
+    double end = now() + ms / 1000.0;
+    while (now() < end) {
+        if (scr_what) eyes();
+        msleep(ALIVE_MS);
+    }
+}
+
 /* bow towards pang (radians, imu_read()'s axes), then stand again */
 static void bow_to(double pang, double peak)
 {
@@ -2283,13 +2356,15 @@ static void bow_to(double pang, double peak)
     printf("\r\x1b[Ktipped %.1f deg towards %.0f deg: bowing on legs %d+%d (lifts %d, %d)\n", peak, pang * 180 / M_PI,
            legs[lo].hip, legs[hi].hip, legs[lo].lift, legs[hi].lift);
     fflush(stdout);
-    look_ang = pang;
-    look_on = 1;
+    /* that gap is now the front, and the face turns to it */
+    int k = legs[hi].hip - legs[lo].hip == 1 ? legs[lo].hip : legs[hi].hip;     /* gap k is legs k and k+1; 6 and 1 is 6 */
+    set_front(k);
+    printf("      the front is now gap %d (legs %d and %d)\n", k, k, k % 6 + 1);
     /* z for a lift position of BOW_POS + offset, as leg_goals() works it out */
     legs[n1].z = height + legs[n1].lift_dir * (BOW_POS - CENTRE);
     legs[n2].z = height + legs[n2].lift_dir * (BOW_POS - CENTRE);
     send_pose(BOW_MS);
-    msleep(BOW_MS + BOW_HOLD_MS);
+    face_wait(BOW_MS + BOW_HOLD_MS);
     stand(BOW_MS);
 }
 

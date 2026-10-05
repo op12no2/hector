@@ -92,6 +92,7 @@ static void die(const char *fmt, ...)
 #define BUS_UART UART_NUM_1
 #define BUS_TX   38
 #define BUS_RX   39
+#define BUS_ECHO 0      /* the H2 link doesn't loop TX back to RX, so txrx() doesn't read for an echo (which costs a timeout per write) */
 
 static void open_port(const char *dev, int baud)
 {
@@ -259,7 +260,8 @@ static void lcd_send(int dc, const void *p, int n)
 static void lcd_cmds(const unsigned char *c)
 {
     while (*c != 0xFF) {
-        unsigned char cmd = *c++, n = *c++, par[16];
+        unsigned char cmd = *c++, n = *c++, par[32];
+        if ((n & 0x7F) > sizeof par) die("lcd init list: %d parameters", n & 0x7F);
         lcd_send(0, &cmd, 1);
         memcpy(par, c, n & 0x7F);           /* via RAM: DMA can't read flash */
         if (n & 0x7F) lcd_send(1, par, n & 0x7F);
@@ -488,6 +490,7 @@ static const char *scr_init(int *ok)
 #include "atom/bmi270_config.h"
 
 static i2c_master_dev_handle_t imu;
+static double imu_c, imu_s;             /* cos and sin of IMU_YAW, from imu_init() */
 
 static int imu_wr(int reg, int v)
 {
@@ -501,11 +504,22 @@ static int imu_rd(int reg, unsigned char *b, int n)
     return i2c_master_transmit_receive(imu, &r, 1, b, n, 50) == ESP_OK ? 0 : -1;
 }
 
+/* the IMU didn't answer or start: drop its handle, so imu_read() fails rather than reading an unconfigured chip */
+static int imu_fail(void)
+{
+    if (imu) i2c_master_bus_rm_device(imu);
+    imu = NULL;
+    return -1;
+}
+
 /* 0 if it's there and its config loaded, -1 if not (1 = no IMU on this host, the Pi's stub) */
 static int imu_init(void)
 {
     unsigned char id = 0, st = 0, buf[1 + 256];
-    if (sys_i2c_dev(IMU_ADDR, &imu) || imu_rd(0x00, &id, 1) || id != 0x24) return -1;     /* CHIP_ID */
+    imu_c = cos(IMU_YAW * M_PI / 180);
+    imu_s = sin(IMU_YAW * M_PI / 180);
+    if (sys_i2c_dev(IMU_ADDR, &imu)) return -1;
+    if (imu_rd(0x00, &id, 1) || id != 0x24) return imu_fail();                         /* CHIP_ID */
     imu_wr(0x7E, 0xB6);                         /* CMD: soft reset (needs 2 ms) */
     msleep(5);
     imu_wr(0x7C, 0x00);                         /* PWR_CONF: advanced power save off, for the upload (450 us) */
@@ -515,11 +529,11 @@ static int imu_init(void)
         unsigned char a[3] = { 0x5B, (i / 2) & 0x0F, (i / 2) >> 4 };       /* INIT_ADDR_0/1, in words */
         buf[0] = 0x5E;                                                      /* INIT_DATA */
         memcpy(buf + 1, bmi270_config_file + i, 256);
-        if (i2c_master_transmit(imu, a, 3, 50) != ESP_OK || i2c_master_transmit(imu, buf, sizeof buf, 100) != ESP_OK) return -1;
+        if (i2c_master_transmit(imu, a, 3, 50) != ESP_OK || i2c_master_transmit(imu, buf, sizeof buf, 100) != ESP_OK) return imu_fail();
     }
     imu_wr(0x59, 0x01);                         /* INIT_CTRL: config load done */
     for (int i = 0; i < 20 && (st & 0x0F) != 1; i++) { msleep(5); imu_rd(0x21, &st, 1); }  /* INTERNAL_STATUS: 1 = init ok */
-    if ((st & 0x0F) != 1) return -1;
+    if ((st & 0x0F) != 1) return imu_fail();
     imu_wr(0x7D, 0x0E);                         /* PWR_CTRL: accelerometer, gyro, temperature on */
     imu_wr(0x40, 0xA8);                         /* ACC_CONF: 100 Hz, normal filter, performance mode */
     imu_wr(0x41, 0x01);                         /* ACC_RANGE: +-4 g */
@@ -534,7 +548,7 @@ static int imu_init(void)
 static int imu_read(double acc[3], double gyr[3])
 {
     unsigned char b[12];
-    double a[3], g[3], c = cos(IMU_YAW * M_PI / 180), s = sin(IMU_YAW * M_PI / 180);
+    double a[3], g[3], c = imu_c, s = imu_s;
     if (!imu || imu_rd(0x0C, b, 12)) return -1;  /* ACC x y z, GYR x y z, little-endian, chip axes */
     for (int i = 0; i < 3; i++) {
         a[i] = (int16_t)(b[2 * i] | b[2 * i + 1] << 8) * 4.0 / 32768;
@@ -546,6 +560,8 @@ static int imu_read(double acc[3], double gyr[3])
 }
 
 #else
+
+#define BUS_ECHO 1      /* the Waveshare USB adapter loops TX back to RX; txrx() reads and drops it */
 
 static int fd = -1;
 
@@ -693,7 +709,10 @@ static void hexdump(const char *tag, const unsigned char *b, int n)
  * Send instruction packet, receive status packet.
  * Returns number of params in reply (>=0), -1 on timeout/no reply,
  * -2 on bad checksum. *err gets the error byte. The adapter is half
- * duplex so we read back (and discard) our own TX echo first.
+ * duplex, and some (BUS_ECHO) loop TX back to RX, so on those we read back
+ * (and discard) our own TX echo first. Where there is none, don't look for
+ * one: with a reply shorter than the packet sent, that read would wait the
+ * whole timeout for bytes that never come (50 ms on every write).
  */
 static int txrx(int id, int instr, const unsigned char *p, int np,
                 unsigned char *err, unsigned char *out, int outmax)
@@ -712,10 +731,13 @@ static int txrx(int id, int instr, const unsigned char *p, int np,
 
     /* swallow echo if the adapter loops TX back to RX */
     unsigned char rx[64];
-    int got = read_bytes(rx, n, timeout_ms);
-    if (got == n && memcmp(rx, tx, n) == 0) {
-        if (verbose) printf("  (echo)\n");
-        got = 0;
+    int got = 0;
+    if (BUS_ECHO) {
+        got = read_bytes(rx, n, timeout_ms);
+        if (got == n && memcmp(rx, tx, n) == 0) {
+            if (verbose) printf("  (echo)\n");
+            got = 0;
+        }
     }
 
     /* find header */
@@ -1538,7 +1560,7 @@ static void loads(int secs)
 static void imu_stream(int secs)
 {
     double a[3], g[3], a0[3];
-    if (imu_read(a0, g)) { puts("no IMU"); return; }
+    if (imu_st || imu_read(a0, g)) { puts("no IMU"); return; }
     printf("ms         ax     ay     az  (g)     gx     gy     gz  (deg/s)   tilt (deg)\n");
     con_raw(0);
     con_drop();
@@ -1618,10 +1640,7 @@ static int stand(int ms)
 {
     if (check_servos()) return -1;
     limp = 0;
-    for (int i = 0; i < 6; i++) {                       /* torque on: an all stop leaves it off */
-        write_u8(legs[i].hip, REG_TORQUE_ENABLE, 1);
-        write_u8(legs[i].lift, REG_TORQUE_ENABLE, 1);
-    }
+    write_u8(BROADCAST, REG_TORQUE_ENABLE, 1);          /* torque on, all twelve in one packet: an all stop leaves it off */
     for (int i = 0; i < 6; i++) legs[i].x = legs[i].z = 0;
     send_pose(ms);
     msleep(ms + 200);
@@ -1792,16 +1811,14 @@ static void ident(const int *ids, int nid)
  */
 #define STOP_LOAD   500         /* 0.1% */
 #define LIFTED_LOAD 30
+#define LIFTED_ROUNDS 2         /* rounds of 12 reads in a row with no lift over LIFTED_LOAD: one could straddle a tripod changeover */
 #define STOP_GYRO   120.0       /* deg/s */
 #define STOP_JOLT   1.0         /* g from 1 */
 
 static void go_limp(const char *why)
 {
     limp = 1;
-    for (int i = 0; i < 6; i++) {
-        write_u8(legs[i].hip, REG_TORQUE_ENABLE, 0);
-        write_u8(legs[i].lift, REG_TORQUE_ENABLE, 0);
-    }
+    write_u8(BROADCAST, REG_TORQUE_ENABLE, 0);         /* all twelve at once, in one packet (no replies to wait for) */
     standing = 0;
     printf("\nall stop: %s; limp (stand gets up again)\n", why);
     fflush(stdout);
@@ -1831,7 +1848,7 @@ static void walk(int cycles, int str, int turn)
            g->name, period, str, turn, lift, tty ? "any key stops, " : "");
     fflush(stdout);
     double phase = 0, r = 0, t = now(), gmax = 0, jmax = 0;
-    int lift_max = 0, lifted_ok = 0;    /* the most load on any lift this round of 12 reads, and since the walk began */
+    int lift_max = 0, lifted_ok = 0, quiet = 0;    /* the most load on any lift this round of 12 reads; any yet since the walk began; rounds with none */
     int stopping = 0;
     char stop_why[64] = "";
     tick_start();
@@ -1882,8 +1899,8 @@ static void walk(int cycles, int str, int turn)
         if ((ld & 0x3FF) > STOP_LOAD) snprintf(stop_why, sizeof stop_why, "servo %d at %d%% load", id, (ld & 0x3FF) / 10);
         if ((tick - 1) % 12 >= 6 && (ld & 0x3FF) > lift_max) lift_max = ld & 0x3FF;     /* that read was a lift */
         if (tick % 12 == 0) {                   /* a round done: was anything standing on the ground? */
-            if (lift_max > LIFTED_LOAD) lifted_ok = 1;
-            else if (lifted_ok) snprintf(stop_why, sizeof stop_why, "no weight on any foot (picked up?)");
+            if (lift_max > LIFTED_LOAD) { lifted_ok = 1; quiet = 0; }
+            else if (lifted_ok && ++quiet >= LIFTED_ROUNDS) snprintf(stop_why, sizeof stop_why, "no weight on any foot (picked up?)");
             lift_max = 0;
         }
         double a[3], gy[3];
@@ -2335,11 +2352,13 @@ static int watch(void)
     char s[16] = "", why[96] = "";
     for (int k = 0; k < 12; k++) {
         if (w_servo[k].miss >= WATCH_MISS) nmiss++;
-        else if (w_servo[k].volt < vmin) vmin = w_servo[k].volt;
+        else if (!w_servo[k].miss && w_servo[k].volt < vmin) vmin = w_servo[k].volt;   /* a miss leaves volt stale, or 0 before its first reply */
     }
-    /* battery with a little hysteresis, so it doesn't flicker at the limit */
-    w_batt_low = vmin < BATT_FLAT ? 2 : vmin < BATT_LOW ? (w_batt_low == 2 && vmin < BATT_FLAT + 2 ? 2 : 1)
-               : w_batt_low && vmin < BATT_LOW + 2 ? w_batt_low : 0;
+    /* battery (2 flat, 1 low, 0 fine) with 0.2 V of hysteresis, so it doesn't flicker at the limits */
+    if (vmin < BATT_FLAT) w_batt_low = 2;
+    else if (vmin < BATT_LOW) { if (w_batt_low != 2 || vmin >= BATT_FLAT + 2) w_batt_low = 1; }
+    else if (!w_batt_low || vmin >= BATT_LOW + 2) w_batt_low = 0;
+    else w_batt_low = 1;
     for (int k = 0; k < 12 && level < T_FAIL; k++) {
         int kid = k < 6 ? legs[k].hip : legs[k - 6].lift;
         if (nmiss == 12) { level = T_FAIL; snprintf(s, sizeof s, "no servos"); snprintf(why, sizeof why, "no servo replies: battery off?"); }
@@ -2645,12 +2664,12 @@ static int edit_line(char *buf, int size)
         } else if (c == 1) cur = 0;                                /* ctrl-a */
         else if (c == 5) cur = len;                                /* ctrl-e */
         else if (c == 21) len = cur = 0;                           /* ctrl-u */
-        else if (c == 27) {                                        /* escape sequence */
-            int e = con_getc();
+        else if (c == 27) {                                        /* escape sequence (a lone escape: nothing; don't block the idle loop on it) */
+            int e = con_getc_ms(50);
             if (e != '[' && e != 'O') continue;
-            int k = con_getc();
+            int k = con_getc_ms(50);
             if (k >= '0' && k <= '9') {                            /* ESC [ n ~ */
-                if (con_getc() != '~') continue;
+                if (con_getc_ms(50) != '~') continue;
                 k = (k == '1' || k == '7') ? 'H' : (k == '4' || k == '8') ? 'F' : (k == '3') ? 'X' : 0;
             }
             if (k == 'A' || k == 'B') {                            /* up / down: history */

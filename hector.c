@@ -1183,6 +1183,7 @@ static const char *scr_what;                                  /* from scr_init()
 static int scr_ok;
 static int imu_st;                                            /* from imu_init() */
 static int standing;                                          /* stand ran last (not sit, or a frozen walk) */
+static double t_shown;                                        /* the eyes show the self test's result until then */
 
 static void t_draw(const struct t_line *l, int n, int y)
 {
@@ -1425,6 +1426,7 @@ static void t_standing(void)
 static int t_end(void)
 {
     printf("self test: %s\n", t_worst == T_OK ? "all ok" : t_worst == T_WARN ? "warnings" : "problems");
+    t_shown = now() + 15;               /* the eyes show this result for a while; then the watch's */
     if (scr_what) msleep(1000);         /* the log stays up a moment; then alive() draws the eyes */
     return t_worst;
 }
@@ -2153,6 +2155,11 @@ static double look_ang;
 static int look_on;
 static int eyes_dirty = 1;      /* redraw: something else used the screen */
 
+/* the servo watch's state (watch(), below): per servo, and the worst problem now */
+static struct { int volt, temp, load, err, miss; double hi_since; } w_servo[12];
+static int w_next, w_level, w_swept, w_batt_low;
+static char w_text[16];
+
 static double frand(double lo, double hi) { return lo + (hi - lo) * rand() / (double)RAND_MAX; }
 
 static void eyes(void)
@@ -2187,11 +2194,23 @@ static void eyes(void)
     cx += (tx - cx) * 0.25;
     cy += (ty - cy) * 0.25;
 
+    /* the status: the self test's for a while after it, then the watch's */
+    int level = w_level;
+    const char *text = w_text;
+    if (t < t_shown || !w_swept) { level = t_worst; text = t_nbad ? t_bad[0].s : ""; }
+    static int last_level = -1;
+    static char last_text[16];
+    if (level != last_level || strcmp(text, last_text)) {
+        eyes_dirty = 1;
+        last_level = level;
+        snprintf(last_text, sizeof last_text, "%s", text);
+    }
+    static const int white[] = { 0xFFFF, 0xFFE0, 0xF800 };
+
     int lid = (int)lround((EYE_UP + EYE_DOWN) * (1 - open)), px = (int)lround(cx * LOOK_X), py = (int)lround(cy * LOOK_Y);
     if (!eyes_dirty && lid == last_open && px == last_px && py == last_py) return;
     eyes_dirty = 0; last_open = lid; last_px = px; last_py = py;
 
-    static const int white[] = { 0xFFFF, 0xFFE0, 0xF800 };
     scr_clear();
     for (int side = -1; side <= 1; side += 2) {
         int ex = 64 + side * EYE_X;
@@ -2200,7 +2219,7 @@ static void eyes(void)
             int top = -(int)lround(EYE_UP * k), bottom = (int)lround(EYE_DOWN * k);
             if (top < -EYE_UP + lid) top = -EYE_UP + lid;           /* the lid, down from the top */
             for (int y = top; y <= bottom; y++) {
-                int dx = x - px, dy = y - py, r2 = dx * dx + dy * dy, c = white[t_worst];
+                int dx = x - px, dy = y - py, r2 = dx * dx + dy * dy, c = white[level];
                 if ((x + 7) * (x + 7) + (y + 8) * (y + 8) <= 16) c = 0xFFFF;   /* the highlight stays put */
                 else if (r2 <= PUPIL_R * PUPIL_R) c = 0x0000;
                 else if (r2 <= IRIS_R * IRIS_R) c = IRIS_COLOUR;
@@ -2208,13 +2227,125 @@ static void eyes(void)
             }
         }
     }
-    if (t_nbad) scr_text(4, 108, 2, t_colour[t_bad[0].level], t_bad[0].s);
+    if (*text) scr_text(4, 108, 2, t_colour[level], text);
     scr_show();
 }
 
-static void alive(void)
+/*
+ * Watching the servos, from alive(): one servo per call, round robin, so each
+ * about every 12 x ALIVE_MS: its load, voltage, temperature and the error
+ * bits in its reply (a 4-byte read from 0x3C with a 10 ms timeout). After
+ * each sweep it judges the worst problem: under the eyes (whites yellow or
+ * red), and a line on the console when it starts or clears. The serious
+ * ones make it sit if it's standing, which takes the load off.
+ */
+#define WATCH_LOAD    600       /* 0.1%: held this high for WATCH_LOAD_S is serious */
+#define WATCH_LOAD_S  2.0       /* overload protection cuts in at 80% for 4 s */
+#define WATCH_WARM    55        /* C */
+#define WATCH_HOT     65
+#define WATCH_MISS    3         /* reads in a row with no reply */
+
+
+/* 1 if it printed (so the line being typed needs redrawing) */
+static int watch(void)
 {
+    int i = w_next, id = i < 6 ? legs[i].hip : legs[i - 6].lift, save = timeout_ms;
+    unsigned char b[4], e = 0;
+    w_next = (w_next + 1) % 12;
+    timeout_ms = 10;
+    int r = txrx(id, INST_READ, (unsigned char[]){ REG_PRESENT_LOAD, 4 }, 2, &e, b, 4);
+    timeout_ms = save;
+    if (r != 4) w_servo[i].miss++;
+    else {
+        int v = get16(b);
+        w_servo[i].miss = 0;
+        w_servo[i].load = v & 0x3FF;
+        w_servo[i].volt = b[2];
+        w_servo[i].temp = b[3];
+        w_servo[i].err = e;
+        if (w_servo[i].load < WATCH_LOAD) w_servo[i].hi_since = 0;
+        else if (!w_servo[i].hi_since) w_servo[i].hi_since = now();
+    }
+    if (w_next) return 0;
+    w_swept = 1;
+
+    /* the worst problem, most serious first */
+    int level = T_OK, serious = 0, nmiss = 0, vmin = 255;
+    char s[16] = "", why[96] = "";
+    for (int k = 0; k < 12; k++) {
+        if (w_servo[k].miss >= WATCH_MISS) nmiss++;
+        else if (w_servo[k].volt < vmin) vmin = w_servo[k].volt;
+    }
+    /* battery with a little hysteresis, so it doesn't flicker at the limit */
+    w_batt_low = vmin < BATT_FLAT ? 2 : vmin < BATT_LOW ? (w_batt_low == 2 && vmin < BATT_FLAT + 2 ? 2 : 1)
+               : w_batt_low && vmin < BATT_LOW + 2 ? w_batt_low : 0;
+    for (int k = 0; k < 12 && level < T_FAIL; k++) {
+        int kid = k < 6 ? legs[k].hip : legs[k - 6].lift;
+        if (nmiss == 12) { level = T_FAIL; snprintf(s, sizeof s, "no servos"); snprintf(why, sizeof why, "no servo replies: battery off?"); }
+        else if (w_servo[k].miss >= WATCH_MISS) { level = T_FAIL; snprintf(s, sizeof s, "no %d", kid); snprintf(why, sizeof why, "servo %d doesn't reply", kid); }
+        else if (w_servo[k].err & 0x24) {
+            level = T_FAIL; serious = 1;
+            snprintf(s, sizeof s, "%d %s", kid, w_servo[k].err & 0x20 ? "load" : "hot");
+            snprintf(why, sizeof why, "servo %d reports %s", kid, errstr(w_servo[k].err));
+        }
+        else if (w_servo[k].temp >= WATCH_HOT) {
+            level = T_FAIL; serious = 1;
+            snprintf(s, sizeof s, "%d %dC", kid, w_servo[k].temp);
+            snprintf(why, sizeof why, "servo %d at %d C", kid, w_servo[k].temp);
+        }
+        else if (w_servo[k].hi_since && now() - w_servo[k].hi_since > WATCH_LOAD_S) {
+            level = T_FAIL; serious = 1;
+            snprintf(s, sizeof s, "%d load", kid);
+            snprintf(why, sizeof why, "servo %d held at %d%% load for %.0f s", kid, w_servo[k].load / 10, WATCH_LOAD_S);
+        }
+    }
+    if (level < T_FAIL && w_batt_low == 2) {
+        level = T_FAIL; serious = 1;
+        snprintf(s, sizeof s, "batt %.1fV", vmin / 10.0);
+        snprintf(why, sizeof why, "battery flat: %.1f V", vmin / 10.0);
+    }
+    for (int k = 0; k < 12 && level < T_WARN; k++) {
+        int kid = k < 6 ? legs[k].hip : legs[k - 6].lift;
+        if (w_servo[k].miss >= WATCH_MISS) continue;
+        if (w_servo[k].temp >= WATCH_WARM) {
+            level = T_WARN;
+            snprintf(s, sizeof s, "%d %dC", kid, w_servo[k].temp);
+            snprintf(why, sizeof why, "servo %d warm: %d C", kid, w_servo[k].temp);
+        }
+        else if (w_servo[k].err) {
+            level = T_WARN;
+            snprintf(s, sizeof s, "%d %s", kid, w_servo[k].err & 1 ? "volt" : "err");
+            snprintf(why, sizeof why, "servo %d reports %s", kid, errstr(w_servo[k].err));
+        }
+    }
+    if (level < T_WARN && w_batt_low == 1) {
+        level = T_WARN;
+        snprintf(s, sizeof s, "batt %.1fV", vmin / 10.0);
+        snprintf(why, sizeof why, "battery low: %.1f V", vmin / 10.0);
+    }
+
+    if (level == w_level && !strcmp(s, w_text)) return 0;
+    int printed = 1;
+    printf("\r\x1b[K");
+    if (level) printf("%s %s\n", level == T_FAIL ? "FAIL " : "warn ", why);
+    else printf("ok    the servos are fine again\n");
+    w_level = level;
+    snprintf(w_text, sizeof w_text, "%s", s);
+    eyes_dirty = 1;
+    if (serious && standing) {
+        printf("      sitting down, to take the load off\n");
+        sit(1000);
+    }
+    fflush(stdout);
+    return printed;
+}
+
+/* 1 if it printed (so the line being typed needs redrawing) */
+static int alive(void)
+{
+    int printed = watch();
     if (scr_what) eyes();
+    return printed;
 }
 
 /* minimal line editor for a tty: arrows, history, home/end, backspace */
@@ -2248,7 +2379,8 @@ static int edit_line(char *buf, int size)
     eyes_dirty = 1;         /* back from a command, which may have used the screen */
     for (;;) {
         int c;
-        while ((c = con_getc_ms(ALIVE_MS)) == -2) alive();
+        while ((c = con_getc_ms(ALIVE_MS)) == -2)
+            if (alive()) redraw(buf, len, cur);
         int lf = c == '\n' && prev == '\r';
         prev = c;
         if (c < 0) { ok = 0; break; }

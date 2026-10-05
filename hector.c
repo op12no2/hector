@@ -1515,9 +1515,11 @@ static int stand(int ms)
  * Sit: every lift up to SIT_POS (plus its offset, as move would send), taking
  * ms, so the body comes down onto the ground and the legs point up inside it,
  * which takes the load off the servos. For switching off. The hips stay put.
- * It's past what send_pose() allows (UP_MAX), so it's sent directly.
+ * It's past what send_pose() allows (UP_MAX), so it's sent directly, capped
+ * at the servos' angle limit (all 12 have 20..1003), which they'd clamp to anyway.
  */
 #define SIT_POS 1000
+#define SIT_MAX 1003
 
 static void sit(int ms)
 {
@@ -1526,6 +1528,7 @@ static void sit(int ms)
     for (int i = 0; i < 6; i++) {
         ids[i] = legs[i].lift;
         pos[i] = CENTRE + offset[ids[i]] + legs[i].lift_dir * (SIT_POS - CENTRE);
+        if (pos[i] > SIT_MAX) pos[i] = SIT_MAX;
         legs[i].z = SIT_POS - CENTRE + height;      /* where they are, as far as stand/walk know */
     }
     sync_move(ids, 6, pos, ms, 0);

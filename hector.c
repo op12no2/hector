@@ -83,8 +83,8 @@ static void die(const char *fmt, ...)
 /*
  * ---- I/O ----
  * The servo bus (open_port, bus_flush, bus_write, read_bytes), the console
- * (con_*), timing (msleep, tick_*) and the screen (scr_*: the ATOM's; stubs on
- * the Pi). Everything else is the same on the Pi and the ATOM.
+ * (con_*), timing (msleep, tick_*), the screen (scr_*) and the IMU (imu_*):
+ * the last two are the ATOM's, stubs on the Pi. Everything else is the same on the Pi and the ATOM.
  */
 #ifdef ESP_PLATFORM
 
@@ -167,7 +167,7 @@ static void tick_wait(int ms) { xTaskDelayUntil(&tick_last, pdMS_TO_TICKS(ms)); 
  * The screen: 0.85" 128x128 on SPI (MOSI G21, SCLK G15, CS G14, DC G42, RST G48).
  * The panel is a GC9107, or an ST7735S on some batches, told apart by RDDID as
  * M5GFX does (init sequences and offsets are from M5GFX too). The backlight is
- * an LP5562 LED driver on the internal I2C (SDA G45, SCL G0, shared with the IMU).
+ * an LP5562 LED driver on the internal I2C (SDA G45, SCL G0), which the IMU shares.
  * Drawing goes into fb[], and scr_show() sends all of it (32 KB, about 7 ms).
  */
 #define LCD_HOST SPI3_HOST
@@ -176,8 +176,8 @@ static void tick_wait(int ms) { xTaskDelayUntil(&tick_last, pdMS_TO_TICKS(ms)); 
 #define LCD_CS   14
 #define LCD_DC   42
 #define LCD_RST  48
-#define BL_SDA   45
-#define BL_SCL   0
+#define SYS_SDA  45     /* the internal I2C: backlight and IMU */
+#define SYS_SCL  0
 #define BL_ADDR  0x30   /* LP5562 */
 #define BL_LEVEL 160    /* 0..255 */
 
@@ -396,17 +396,24 @@ static void scr_show(void)
     cmd = 0x2C; lcd_send(0, &cmd, 1); lcd_send(1, fb, sizeof fb);  /* RAMWR */
 }
 
+/* a device on the internal I2C (SDA G45, SCL G0: the backlight and the IMU), setting the bus up first time */
+static int sys_i2c_dev(int addr, i2c_master_dev_handle_t *d)
+{
+    static i2c_master_bus_handle_t bus;
+    i2c_master_bus_config_t b = {
+        .i2c_port = -1, .sda_io_num = SYS_SDA, .scl_io_num = SYS_SCL, .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7, .flags.enable_internal_pullup = 1,
+    };
+    i2c_device_config_t c = { .dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = addr, .scl_speed_hz = 400000 };
+    if (!bus && i2c_new_master_bus(&b, &bus) != ESP_OK) { bus = NULL; return -1; }
+    return i2c_master_bus_add_device(bus, &c, d) == ESP_OK ? 0 : -1;
+}
+
 /* LP5562: enable, internal clock, all channels from their PWM registers, W (the backlight) to level */
 static int bl_init(int level)
 {
-    i2c_master_bus_config_t b = {
-        .i2c_port = -1, .sda_io_num = BL_SDA, .scl_io_num = BL_SCL, .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7, .flags.enable_internal_pullup = 1,
-    };
-    i2c_device_config_t c = { .dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = BL_ADDR, .scl_speed_hz = 400000 };
-    i2c_master_bus_handle_t bus;
     i2c_master_dev_handle_t d;
-    if (i2c_new_master_bus(&b, &bus) != ESP_OK || i2c_master_bus_add_device(bus, &c, &d) != ESP_OK) return -1;
+    if (sys_i2c_dev(BL_ADDR, &d)) return -1;
     unsigned char w[][2] = { { 0x00, 0x40 }, { 0x08, 0x01 }, { 0x70, 0x00 }, { 0x0E, level } };
     for (int i = 0; i < 4; i++) {
         if (i2c_master_transmit(d, w[i], 2, 50) != ESP_OK) return -1;
@@ -451,6 +458,71 @@ static const char *scr_init(int *ok)
     scr_show();
     *ok = bl_init(BL_LEVEL) == 0 && (st || gc);
     return what;
+}
+
+/*
+ * The IMU: a Bosch BMI270 (accelerometer and gyro) at 0x68 on the internal
+ * I2C. It needs Bosch's 8 KB configuration file uploaded at every start-up.
+ * Accelerometer +-4 g at 100 Hz, gyro +-500 deg/s at 200 Hz. As the ATOM is
+ * mounted, the chip's axes are the robot's: +x forward, +y left, +z up
+ * (found by tipping it up at each edge).
+ */
+#define IMU_ADDR 0x68
+#include "atom/bmi270_config.h"
+
+static i2c_master_dev_handle_t imu;
+
+static int imu_wr(int reg, int v)
+{
+    unsigned char w[2] = { reg, v };
+    return i2c_master_transmit(imu, w, 2, 50) == ESP_OK ? 0 : -1;
+}
+
+static int imu_rd(int reg, unsigned char *b, int n)
+{
+    unsigned char r = reg;
+    return i2c_master_transmit_receive(imu, &r, 1, b, n, 50) == ESP_OK ? 0 : -1;
+}
+
+/* 0 if it's there and its config loaded, -1 if not (1 = no IMU on this host, the Pi's stub) */
+static int imu_init(void)
+{
+    unsigned char id = 0, st = 0, buf[1 + 256];
+    if (sys_i2c_dev(IMU_ADDR, &imu) || imu_rd(0x00, &id, 1) || id != 0x24) return -1;     /* CHIP_ID */
+    imu_wr(0x7E, 0xB6);                         /* CMD: soft reset (needs 2 ms) */
+    msleep(5);
+    imu_wr(0x7C, 0x00);                         /* PWR_CONF: advanced power save off, for the upload (450 us) */
+    msleep(5);
+    imu_wr(0x59, 0x00);                         /* INIT_CTRL: start of config load */
+    for (int i = 0; i < (int)sizeof bmi270_config_file; i += 256) {
+        unsigned char a[3] = { 0x5B, (i / 2) & 0x0F, (i / 2) >> 4 };       /* INIT_ADDR_0/1, in words */
+        buf[0] = 0x5E;                                                      /* INIT_DATA */
+        memcpy(buf + 1, bmi270_config_file + i, 256);
+        if (i2c_master_transmit(imu, a, 3, 50) != ESP_OK || i2c_master_transmit(imu, buf, sizeof buf, 100) != ESP_OK) return -1;
+    }
+    imu_wr(0x59, 0x01);                         /* INIT_CTRL: config load done */
+    for (int i = 0; i < 20 && (st & 0x0F) != 1; i++) { msleep(5); imu_rd(0x21, &st, 1); }  /* INTERNAL_STATUS: 1 = init ok */
+    if ((st & 0x0F) != 1) return -1;
+    imu_wr(0x7D, 0x0E);                         /* PWR_CTRL: accelerometer, gyro, temperature on */
+    imu_wr(0x40, 0xA8);                         /* ACC_CONF: 100 Hz, normal filter, performance mode */
+    imu_wr(0x41, 0x01);                         /* ACC_RANGE: +-4 g */
+    imu_wr(0x42, 0xA9);                         /* GYR_CONF: 200 Hz, normal filter, performance mode */
+    imu_wr(0x43, 0x02);                         /* GYR_RANGE: +-500 deg/s */
+    imu_wr(0x7C, 0x02);                         /* PWR_CONF: FIFO self wake-up, no power save */
+    msleep(50);
+    return 0;
+}
+
+/* acceleration in g (+1 on z standing level) and rotation in deg/s: x forward, y left, z up */
+static int imu_read(double acc[3], double gyr[3])
+{
+    unsigned char b[12];
+    if (!imu || imu_rd(0x0C, b, 12)) return -1;  /* ACC x y z, GYR x y z, little-endian */
+    for (int i = 0; i < 3; i++) {
+        acc[i] = (int16_t)(b[2 * i] | b[2 * i + 1] << 8) * 4.0 / 32768;
+        gyr[i] = (int16_t)(b[6 + 2 * i] | b[7 + 2 * i] << 8) * 500.0 / 32768;
+    }
+    return 0;
 }
 
 #else
@@ -571,6 +643,10 @@ static const char *scr_init(int *ok) { *ok = 0; return NULL; }
 static void scr_clear(void) {}
 static void scr_text(int x, int y, int scale, int colour, const char *s) { (void)x; (void)y; (void)scale; (void)colour; (void)s; }
 static void scr_show(void) {}
+
+/* nor an IMU */
+static int imu_init(void) { return 1; }
+static int imu_read(double acc[3], double gyr[3]) { (void)acc; (void)gyr; return -1; }
 
 #endif
 
@@ -795,6 +871,7 @@ static void help(void)
     "set [name value]          list or set walk parameters: gait step stride lift height\n"
     "loads [secs]              stream every servo's load and position error (default 10 s, or until a key);\n"
     "                          reads only: stand first to see what pushing on it does\n"
+    "imu [secs]                stream the ATOM's IMU: acceleration, rotation and tilt (default 10 s, or until a key)\n"
     "selftest                  the startup checks again (reads only, nothing moves): servos, battery,\n"
     "                          temperature, errors, overload settings, positions, load; on the ATOM's screen too");
 }
@@ -1050,6 +1127,7 @@ static struct t_line t_log[T_ROWS], t_bad[T_ROWS];
 static int t_nlog, t_nbad, t_worst;
 static const char *scr_what;                                  /* from scr_init(); NULL with no screen */
 static int scr_ok;
+static int imu_st;                                            /* from imu_init() */
 
 static void t_draw(const struct t_line *l, int n, int y)
 {
@@ -1095,6 +1173,18 @@ static int selftest(void)
 
     if (scr_what) t_line(scr_ok ? T_OK : T_WARN, scr_ok ? "screen" : "screen?", "screen: %s%s", scr_what,
                          scr_ok ? "" : "; the backlight (LP5562) didn't answer or the panel wasn't recognised");
+
+    if (imu_st <= 0) {
+        double a[3], g[3];
+        if (imu_st < 0 || imu_read(a, g)) t_line(T_FAIL, "no imu", "IMU (BMI270) didn't answer or start");
+        else {
+            double pitch = atan2(a[0], a[2]) * 180 / M_PI, roll = atan2(a[1], a[2]) * 180 / M_PI;
+            char s[16];
+            snprintf(s, sizeof s, "tilt %.1f", hypot(pitch, roll));
+            t_line(T_OK, s, "IMU: pitch %.1f deg (+ = nose up), roll %.1f deg (+ = left side up), rotation %.1f %.1f %.1f deg/s",
+                   pitch, roll, g[0], g[1], g[2]);
+        }
+    }
 
     /* every servo replies (quietly: a missing battery would print 12 "no reply"s) */
     for (int i = 0; i < 12; i++) {
@@ -1215,25 +1305,30 @@ done:
  * foot pushing down and + error the foot above its goal; a hip's + is forward.
  * The screen shows the seconds, to time presses by.
  */
-static void loads(int secs)
+/* title and the whole seconds since t0 on the screen, when they change: to time presses or lifts by */
+static void scr_secs(const char *title, double t0, int *shown)
 {
     char buf[16];
+    int s = now() - t0;
+    if (!scr_what || s == *shown) return;
+    *shown = s;
+    snprintf(buf, sizeof buf, "%d", s);
+    scr_clear();
+    scr_text(4, 4, 2, 0xFFFF, title);
+    scr_text(64 - (int)strlen(buf) * 18, 40, 6, 0xFFFF, buf);
+    scr_show();
+}
+
+static void loads(int secs)
+{
     printf("ms      LF hip  lift    LM hip  lift    LR hip  lift    RF hip  lift    RM hip  lift    RR hip  lift   (load/error)\n");
     con_raw(0);
     con_drop();
     double t0 = now();
     int shown = -1;
     while (now() - t0 < secs && con_getc() < 0 && !halted) {
-        int t = (now() - t0) * 1000;
-        if (scr_what && t / 1000 != shown) {
-            shown = t / 1000;
-            snprintf(buf, sizeof buf, "%d", shown);
-            scr_clear();
-            scr_text(4, 4, 2, 0xFFFF, "loads");
-            scr_text(64 - (int)strlen(buf) * 18, 40, 6, 0xFFFF, buf);
-            scr_show();
-        }
-        printf("%6d", t);
+        scr_secs("loads", t0, &shown);
+        printf("%6d", (int)((now() - t0) * 1000));
         for (int i = 0; i < 6; i++)
             for (int j = 0; j < 2; j++) {
                 const struct leg *L = &legs[i];
@@ -1246,6 +1341,34 @@ static void loads(int secs)
                 printf("%s %4d/%-3d", j ? "" : "  ", dir * ld, dir * (pos - goal));
             }
         putchar('\n');
+    }
+    con_restore();
+    if (scr_what) { scr_clear(); scr_show(); }
+}
+
+/*
+ * Stream the IMU for secs seconds (or until a key), 50 lines a second: ms,
+ * acceleration (g) and rotation (deg/s), x forward, y left, z up, and the
+ * tilt from the first reading (deg). The screen shows the seconds.
+ */
+static void imu_stream(int secs)
+{
+    double a[3], g[3], a0[3];
+    if (imu_read(a0, g)) { puts("no IMU"); return; }
+    printf("ms         ax     ay     az  (g)     gx     gy     gz  (deg/s)   tilt (deg)\n");
+    con_raw(0);
+    con_drop();
+    double t0 = now();
+    int shown = -1;
+    tick_start();
+    while (now() - t0 < secs && con_getc() < 0 && !halted) {
+        scr_secs("imu", t0, &shown);
+        if (imu_read(a, g)) { puts("IMU read failed"); break; }
+        double dot = a[0] * a0[0] + a[1] * a0[1] + a[2] * a0[2];
+        double na = sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]), n0 = sqrt(a0[0] * a0[0] + a0[1] * a0[1] + a0[2] * a0[2]);
+        printf("%6d  %6.3f %6.3f %6.3f   %6.1f %6.1f %6.1f   %5.1f\n", (int)((now() - t0) * 1000),
+               a[0], a[1], a[2], g[0], g[1], g[2], acos(clampd(dot / (na * n0), -1, 1)) * 180 / M_PI);
+        tick_wait(20);
     }
     con_restore();
     if (scr_what) { scr_clear(); scr_show(); }
@@ -1638,6 +1761,7 @@ static int run(char **tok, int nt)
     }
     else if (!strcmp(c, "selftest")) selftest();
     else if (!strcmp(c, "loads")) loads(arg(tok, 1, nt, 10, NULL));
+    else if (!strcmp(c, "imu")) imu_stream(arg(tok, 1, nt, 10, NULL));
     else if (!strcmp(c, "set")) {
         const struct param *p = NULL;
         for (int i = 0; nt > 1 && i < (int)(sizeof params / sizeof *params); i++)
@@ -1810,6 +1934,7 @@ void app_main(void)
     con_init();
     open_port(NULL, 1000000);
     scr_what = scr_init(&scr_ok);
+    imu_st = imu_init();
     printf("hector on the ATOM: bus on UART1 (TX G38, RX G39) @ 1000000\n");
     selftest();
     for (;;) {
@@ -1827,6 +1952,7 @@ int main(int argc, char **argv)
     open_port(dev, baud);
     printf("opened %s @ %d\n", dev, baud);
     scr_what = scr_init(&scr_ok);
+    imu_st = imu_init();
     selftest();
     printf("type help\n");
     repl();

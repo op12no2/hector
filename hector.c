@@ -868,6 +868,8 @@ static void help(void)
     "\n"
     "hexapod (leg n: hip id n, lift id n+6; layout and directions in legs[] in hector.c):\n"
     "stand [ms]                all feet down, hips centred, taking ms (default 1000)\n"
+    "sit [ms]                  all lifts up to 1000, taking ms (default 1000): the body sits on the ground with the\n"
+    "                          legs up inside it, no load on the servos; for switching off. stand gets up again\n"
     "legtest [1-6]             each leg in turn (or one, by hip id): up to 700, forward 80, back, down; the others stay put\n"
     "ident [id]                twitch each id (default 1-12) in turn, 1 s apart: +30 from where it is and back\n"
     "offset [id val]           show the per-id offsets added to goal positions, or set one (until exit)\n"
@@ -1510,6 +1512,27 @@ static int stand(int ms)
 }
 
 /*
+ * Sit: every lift up to SIT_POS (plus its offset, as move would send), taking
+ * ms, so the body comes down onto the ground and the legs point up inside it,
+ * which takes the load off the servos. For switching off. The hips stay put.
+ * It's past what send_pose() allows (UP_MAX), so it's sent directly.
+ */
+#define SIT_POS 1000
+
+static void sit(int ms)
+{
+    int ids[6], pos[6];
+    if (check_servos()) return;
+    for (int i = 0; i < 6; i++) {
+        ids[i] = legs[i].lift;
+        pos[i] = CENTRE + offset[ids[i]] + legs[i].lift_dir * (SIT_POS - CENTRE);
+        legs[i].z = SIT_POS - CENTRE + height;      /* where they are, as far as stand/walk know */
+    }
+    sync_move(ids, 6, pos, ms, 0);
+    msleep(ms + 200);
+}
+
+/*
  * Each leg in turn (or just the one with hip id `only`): up, forward, back,
  * down (to its stance pose). Only the leg being tested moves.
  */
@@ -1888,6 +1911,7 @@ static int run(char **tok, int nt)
     else if (!strcmp(c, "loads")) loads(arg(tok, 1, nt, 10, NULL));
     else if (!strcmp(c, "imu")) imu_stream(arg(tok, 1, nt, 10, NULL));
     else if (!strcmp(c, "bow")) bow(arg(tok, 1, nt, 0, NULL));
+    else if (!strcmp(c, "sit")) sit(arg(tok, 1, nt, 1000, NULL));
     else if (!strcmp(c, "set")) {
         const struct param *p = NULL;
         for (int i = 0; nt > 1 && i < (int)(sizeof params / sizeof *params); i++)

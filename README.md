@@ -46,6 +46,7 @@ Leg *n* is hip (yaw) servo *n* and lift servo *n*+6. Where each leg is, and whic
 | Command | Description |
 |---|---|
 | `stand [ms]` | all feet down, hips centred, taking ms (default 1000) |
+| `sit [ms]` | all six lifts up to 1000, taking ms (default 1000), the same as `move 7-12 1000 1000`: the body sits on the ground with the legs pointing up inside it, so there's no load on the servos. Do it before switching off; `stand` gets up again |
 | `legtest [1-6]` | each leg in turn (or one, by hip id): lift servo up to 700, forward 80, back, down to its stance pose; the other legs stay where they are |
 | `ident [id]` | twitch each id (default 1-12) in turn, a second apart, to see which servo has which id: 30 steps up from where it is and back; it prints which leg `legs[]` says the id belongs to |
 | `offset [id val]` | show the per-servo offsets, or set one; the change lasts until exit |

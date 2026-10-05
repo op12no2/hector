@@ -37,7 +37,7 @@ idf.py build
 idf.py -p /dev/serial/by-id/usb-Espressif_* flash monitor     # ctrl-] leaves the monitor
 ```
 
-Every command works the same way there; `quit` has nothing to quit to, and changes to `offset[]` last until the ATOM resets. Any terminal on its USB port works as well as `idf.py monitor` (e.g. `picocom /dev/ttyACM0`), but opening the port with `idf.py monitor` resets the ATOM.
+At power-on the ATOM runs `selftest` and, unless something failed, stands up. Every command works the same way there; `quit` has nothing to quit to, and changes to `offset[]` last until the ATOM resets. Any terminal on its USB port works as well as `idf.py monitor` (e.g. `picocom /dev/ttyACM0`), but opening the port with `idf.py monitor` resets the ATOM.
 
 Leg *n* is hip (yaw) servo *n* and lift servo *n*+6. Where each leg is, and which way each servo turns, is set in `legs[]` at the top of the hexapod section of `hector.c`.
 
@@ -54,6 +54,7 @@ Leg *n* is hip (yaw) servo *n* and lift servo *n*+6. Where each leg is, and whic
 | `set [name value]` | list or set walk parameters (below) |
 | `loads [secs]` | stream every servo's load and position error (goal and position both read from the servo) as fast as the bus allows, about 80 sweeps of all 12 a second, for secs seconds (default 10) or until a key; reads only, so stand first. The ATOM's screen shows the seconds, to time presses by |
 | `imu [secs]` | stream the ATOM's IMU (BMI270) at 50 lines a second: acceleration (g), rotation (deg/s), x forward, y left, z up, and the tilt from the first reading; default 10 s, or until a key |
+| `bow [secs]` | stand, then tip it up at an edge and put it down: it bows towards that edge (the lifts of the two legs nearest it go up to 700 over a second, so that edge of the body comes down onto the ground) and stands again. Needs the ATOM's IMU; until a key, or secs seconds |
 | `selftest` | the checks it runs at startup, again (they only read, nothing moves): the IMU and the body's tilt (ATOM only), every servo replies, battery (warns under 7.0 V, fails under 6.6), temperature, error bits, overload protection at the defaults, positions inside the range the legs are driven over, and the highest load. On the ATOM each check also goes up on the screen as it runs, then the screen says Hi! (green, yellow with warnings, red with failures) with any problems under it |
 
 | Parameter | Default | |

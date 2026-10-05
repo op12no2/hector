@@ -872,6 +872,8 @@ static void help(void)
     "loads [secs]              stream every servo's load and position error (default 10 s, or until a key);\n"
     "                          reads only: stand first to see what pushing on it does\n"
     "imu [secs]                stream the ATOM's IMU: acceleration, rotation and tilt (default 10 s, or until a key)\n"
+    "bow [secs]                stand; tip it up at an edge and put it down, and it bows towards that edge\n"
+    "                          and back up (needs the ATOM's IMU); until a key, or secs seconds\n"
     "selftest                  the startup checks again (reads only, nothing moves): servos, battery,\n"
     "                          temperature, errors, overload settings, positions, load; on the ATOM's screen too");
 }
@@ -1374,6 +1376,115 @@ static void imu_stream(int secs)
     if (scr_what) { scr_clear(); scr_show(); }
 }
 
+/*
+ * Tip it up at an edge and put it down: it bows towards that edge and comes
+ * back up. Stands, takes the IMU's reading as level, then at 50 Hz: a tilt of
+ * over BOW_TIP_ON degrees from level is a tip, and its direction at the
+ * biggest tilt is kept; once it has been back under BOW_TIP_OFF for
+ * BOW_SETTLE_MS (put down and still), it bows: the lifts of the two legs
+ * nearest that way (from where the hips are: 60 degrees apart, the middle
+ * legs straight out) go up to BOW_POS over BOW_MS, the same as
+ * "move 7-8 700 1000" for the left front pair, so that edge of the body
+ * comes down onto the ground (it's designed to land safely), then it
+ * stands, and re-takes level. Until a key, or secs seconds.
+ */
+#define BOW_TIP_ON    3.0     /* deg */
+#define BOW_TIP_OFF   1.5
+#define BOW_SETTLE_MS 300
+#define BOW_POS       700     /* the near lifts' position, as move's (the offset is added) */
+#define BOW_MS        1000    /* to get there, and to stand again */
+
+/* the IMU's acceleration averaged over ms, as the level reference */
+static int bow_level(double a0[3], int ms)
+{
+    double a[3], g[3];
+    int n = 0;
+    a0[0] = a0[1] = a0[2] = 0;
+    for (int t = 0; t < ms; t += 10, n++) {
+        if (imu_read(a, g)) return -1;
+        for (int i = 0; i < 3; i++) a0[i] += a[i];
+        msleep(10);
+    }
+    for (int i = 0; i < 3; i++) a0[i] /= n;
+    return 0;
+}
+
+static const char *bow_dir_name(double ang)
+{
+    static const char *const nm[8] = { "front", "front L", "left", "rear L", "rear", "rear R", "right", "front R" };
+    int k = (int)lround(ang / (M_PI / 4));
+    return nm[((k % 8) + 8) % 8];
+}
+
+static void bow_screen(const char *s, int colour)
+{
+    if (!scr_what) return;
+    scr_clear();
+    scr_text(4, 4, 2, 0xFFFF, "bow");
+    scr_text(4, 56, 2, colour, s);
+    scr_show();
+}
+
+static int stand(int ms);
+
+static void bow(int secs)
+{
+    double a0[3], a[3], g[3];
+    if (imu_read(a, g)) { puts("no IMU"); return; }
+    if (stand(1000)) return;
+    if (bow_level(a0, 500)) { puts("IMU read failed"); return; }
+    printf("tip me up at an edge and put me down; a key stops\n");
+    bow_screen("tip me", 0x07E0);
+    con_raw(0);
+    con_drop();
+    double t0 = now(), peak = 0, pang = 0;
+    int state = 0, settle = 0;          /* 0 waiting for a tip, 1 tipped */
+    tick_start();
+    while ((!secs || now() - t0 < secs) && con_getc() < 0 && !halted) {
+        tick_wait(TICK_MS);
+        if (imu_read(a, g)) { puts("IMU read failed"); break; }
+        /* tilt from level, as the change in the horizontal part of gravity: + x = front up, + y = left up */
+        double dx = a[0] - a0[0], dy = a[1] - a0[1];
+        double tilt = asin(clampd(hypot(dx, dy), 0, 1)) * 180 / M_PI;
+        if (state == 0) {
+            if (tilt > BOW_TIP_ON) { state = 1; peak = 0; settle = 0; bow_screen("...", 0xFFE0); }
+            continue;
+        }
+        if (tilt > peak) { peak = tilt; pang = atan2(dy, dx); }
+        settle = tilt < BOW_TIP_OFF ? settle + TICK_MS : 0;
+        if (settle < BOW_SETTLE_MS) continue;
+
+        bow_screen(bow_dir_name(pang), 0x07E0);
+        /* the two legs pointing most nearly that way */
+        double c[6];
+        int n1 = 0, n2 = 1;
+        for (int i = 0; i < 6; i++) {
+            const double lx[3] = { 0.866, 0, -0.866 }, ly[3] = { 0.5, 1, 0.5 };
+            c[i] = lx[legs[i].row] * cos(pang) + (legs[i].side ? -1 : 1) * ly[legs[i].row] * sin(pang);
+        }
+        for (int i = 0; i < 6; i++) if (c[i] > c[n1]) n1 = i;
+        if (n2 == n1) n2 = 0;
+        for (int i = 0; i < 6; i++) if (i != n1 && c[i] > c[n2]) n2 = i;
+        printf("tipped %s, %.1f deg: bowing on %s", bow_dir_name(pang), peak, leg_name(&legs[n1]));
+        printf(" and %s\n", leg_name(&legs[n2]));         /* leg_name's buffer is static */
+        fflush(stdout);
+        /* z for a lift position of BOW_POS + offset, as leg_goals() works it out */
+        legs[n1].z = height + legs[n1].lift_dir * (BOW_POS - CENTRE);
+        legs[n2].z = height + legs[n2].lift_dir * (BOW_POS - CENTRE);
+        send_pose(BOW_MS);
+        msleep(BOW_MS + 200);
+        if (halted || stand(BOW_MS)) break;
+        if (bow_level(a0, 300)) { puts("IMU read failed"); break; }
+        bow_screen("tip me", 0x07E0);
+        state = 0;
+        tick_start();
+    }
+    con_restore();
+    for (int i = 0; i < 6; i++) legs[i].z = 0;
+    send_pose(BOW_MS);
+    bow_screen("", 0);
+}
+
 /* all feet down, hips centred, taking ms */
 static int stand(int ms)
 {
@@ -1762,6 +1873,7 @@ static int run(char **tok, int nt)
     else if (!strcmp(c, "selftest")) selftest();
     else if (!strcmp(c, "loads")) loads(arg(tok, 1, nt, 10, NULL));
     else if (!strcmp(c, "imu")) imu_stream(arg(tok, 1, nt, 10, NULL));
+    else if (!strcmp(c, "bow")) bow(arg(tok, 1, nt, 0, NULL));
     else if (!strcmp(c, "set")) {
         const struct param *p = NULL;
         for (int i = 0; nt > 1 && i < (int)(sizeof params / sizeof *params); i++)
@@ -1936,7 +2048,7 @@ void app_main(void)
     scr_what = scr_init(&scr_ok);
     imu_st = imu_init();
     printf("hector on the ATOM: bus on UART1 (TX G38, RX G39) @ 1000000\n");
-    selftest();
+    if (selftest() != T_FAIL) stand(1000);      /* power on = stand up, unless something failed */
     for (;;) {
         printf("type help\n");
         repl();

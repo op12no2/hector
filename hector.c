@@ -1232,6 +1232,7 @@ static const char *scr_what;                                  /* from scr_init()
 static int scr_ok;
 static int imu_st;                                            /* from imu_init() */
 static int standing;                                          /* stand ran last (not sit, or a frozen walk) */
+static int stood_height;                                      /* the height it stood at */
 static double t_shown;                                        /* the eyes show the self test's result until then */
 
 static void t_draw(const struct t_line *l, int n, int y)
@@ -1597,7 +1598,7 @@ static void imu_stream(int secs)
  * slide, about 1 degree), and the tilt held over TIP_ON for TIP_HELD_MS;
  * anything else is ignored. Once it has been back under TIP_OFF for
  * TIP_SETTLE_MS (put down and still), the gap opposite the lifted edge
- * becomes the front, the face turns there, and it walks.
+ * becomes the front and it walks, the face turning there as it goes.
  */
 #define TIP_ON        3.0     /* deg */
 #define TIP_OFF       1.5
@@ -1632,6 +1633,7 @@ static int stand(int ms)
     send_pose(ms);
     msleep(ms + 200);
     standing = 1;
+    stood_height = height;
     return 0;
 }
 
@@ -1785,12 +1787,20 @@ static void ident(const int *ids, int nid)
  * ctrl-c freezes where it is (SIGINT on the Pi, a byte on the ATOM).
  * Each tick also reads one servo's load, round robin, for a peak load report;
  * the reads note any status errors (overload), which print after the command.
+ * It stands first, taking a second, unless `quick` and it's already standing
+ * at this height: then it only checks the servos and starts (the tip walk).
+ * The face keeps going while it walks (it turns to a new front, blinks),
+ * drawn on one tick and sent on the next (eyes_split) so neither takes much
+ * of a tick; the longest tick is reported, to show if anything did.
  */
-static void walk(int cycles, int str, int turn, double secs)
+static void eyes(void);
+static int eyes_split;          /* eyes() draws on one call and sends on the next */
+
+static void walk(int cycles, int str, int turn, double secs, int quick)
 {
     const struct gait *g = &gaits[gait];
     double period = step_ms / 1000.0 / g->swing, stance = period - step_ms / 1000.0;
-    if (stand(1000)) return;
+    if (quick && standing && height == stood_height ? check_servos() : stand(1000)) return;
 
     /* a leg is on the ground (0), in the air (1), or on the ground but starting inside its swing window (2) */
     int state[6], settled[6] = {0}, nsettled = 0, tick = 0, peak[12] = {0};
@@ -1809,8 +1819,9 @@ static void walk(int cycles, int str, int turn, double secs)
     printf("walking: %s, %.1f s cycle, stride %d, turn %d, lift %d; %sctrl-c freezes\n",
            g->name, period, str, turn, lift, tty ? "any key stops, " : "");
     fflush(stdout);
-    double phase = 0, r = 0, t = now(), t0 = t;
+    double phase = 0, r = 0, t = now(), t0 = t, dtmax = 0;
     int stopping = 0;
+    eyes_split = 1;
     tick_start();
     while (nsettled < 6) {
         tick_wait(TICK_MS);
@@ -1819,6 +1830,7 @@ static void walk(int cycles, int str, int turn, double secs)
         if (halted) break;
         double t1 = now(), dt = t1 - t;
         t = t1;
+        if (dt > dtmax) dtmax = dt;
         if (dt > 0.1) dt = 0.1;                 /* a stall: slow the gait, don't jump it */
         if (dt > 2 * TICK_MS / 1000.0) tick_start();    /* fell behind: don't burst to catch up */
 
@@ -1856,8 +1868,10 @@ static void walk(int cycles, int str, int turn, double secs)
         int id = tick % 12 < 6 ? legs[tick % 12].hip : legs[tick % 12 - 6].lift, ld = 0;
         if (read_u16(id, REG_PRESENT_LOAD, &ld) == 0 && (ld & 0x3FF) > peak[tick % 12]) peak[tick % 12] = ld & 0x3FF;
         tick++;
+        if (scr_what) eyes();
     }
 
+    eyes_split = 0;
     sigint_restore();
     if (tty) { con_drop(); con_restore(); }    /* drop extra keys, not into the next line */
     if (halted) { puts("\nhalted, holding this pose (stand puts all feet down)"); standing = 0; }
@@ -1871,6 +1885,7 @@ static void walk(int cycles, int str, int turn, double secs)
     printf("peak load %% (a servo over 80%% for 4 s drops to 20%%):");
     for (int k = 0; k < 12; k++) printf(" %d:%d", k < 6 ? legs[k].hip : legs[k - 6].lift, (peak[k] + 5) / 10);
     putchar('\n');
+    printf("longest tick %.0f ms (of %d)\n", dtmax * 1000, TICK_MS);
 }
 
 /* run one tokenised command; returns 1 on quit */
@@ -2033,7 +2048,7 @@ static int run(char **tok, int nt)
             printf("usage: walk [cycles] [stride -%d..%d] [turn -%d..%d]\n", HIP_MAX, HIP_MAX, HIP_MAX, HIP_MAX);
             return 0;
         }
-        walk(cycles, str, turn, 0);
+        walk(cycles, str, turn, 0, 0);
     }
     else if (!strcmp(c, "selftest")) selftest();
     else if (!strcmp(c, "loads")) loads(arg(tok, 1, nt, 10, NULL));
@@ -2167,7 +2182,8 @@ static double frand(double lo, double hi) { return lo + (hi - lo) * rand() / (do
 static void eyes(void)
 {
     static double next_blink, blink_t0 = -1, next_glance, glance_until, gx, gy, cx, cy, beta = 99;
-    static int last_open = -1, last_px = 999, last_py = 999;
+    static int last_open = -1, last_px = 999, last_py = 999, unsent;
+    if (unsent) { scr_show(); unsent = 0; return; }     /* drawn on the last call */
     double t = now();
     if (!next_blink) { next_blink = t + frand(2, 5); next_glance = t + frand(4, 9); }
 
@@ -2247,7 +2263,8 @@ static void eyes(void)
             scr_pixel(sx, sy, col);
         }
     if (*text) scr_text(4, 108, 2, t_colour[level], text);
-    scr_show();
+    if (eyes_split) unsent = 1;
+    else scr_show();
 }
 
 /*
@@ -2368,20 +2385,11 @@ static int watch(void)
     return printed;
 }
 
-/* wait ms, keeping the face going (so it can turn to a new front) */
-static void face_wait(int ms)
-{
-    double end = now() + ms / 1000.0;
-    while (now() < end) {
-        if (scr_what) eyes();
-        msleep(ALIVE_MS);
-    }
-}
-
 /*
  * Tipped at pang (radians, imu_read()'s axes: the edge that was lifted): the
- * gap nearest the opposite way becomes the front, the face turns there, and
- * it walks that way with the current gait and stride for TIP_WALK_S seconds.
+ * gap nearest the opposite way becomes the front and it walks that way with
+ * the current gait and stride for TIP_WALK_S seconds, starting at once (it's
+ * standing already); the face turns to the new front as it goes.
  */
 static void tip_walk(double pang, double peak)
 {
@@ -2391,8 +2399,7 @@ static void tip_walk(double pang, double peak)
            peak, pang * 180 / M_PI, TIP_WALK_S, k, k, k % 6 + 1);
     fflush(stdout);
     set_front(k);
-    face_wait(700);                     /* the face turns first */
-    walk(0, stride, 0, TIP_WALK_S);
+    walk(0, stride, 0, TIP_WALK_S, 1);
 }
 
 /*

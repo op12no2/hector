@@ -2244,18 +2244,24 @@ static void eyes(void)
     if (!eyes_dirty && lid == last_open && px == last_px && py == last_py) return;
     eyes_dirty = 0; last_open = lid; last_px = px; last_py = py;
 
-    float c = cosf(beta), s = sinf(beta);
+    /*
+     * 16384 pixels, and the ESP32-S3 has no float divide (a library call), so
+     * nothing here divides or uses a double, and a pixel outside the eyes' and
+     * the mouth's rows (in the face's frame) is done after the rotation.
+     */
+    float c = cosf(beta), s = sinf(beta), moodf = (float)mood, lidtop = -EYE_UP + lid;
     for (int sy = 0; sy < 128; sy++)
         for (int sx = 0; sx < 128; sx++) {
             int col = 0x0000;
             if (*text && sy >= 104) { scr_pixel(sx, sy, col); continue; }      /* the status strip */
             float X = sx - 63.5f, Y = sy - 63.5f;
             float fx = c * X + s * Y, fy = -s * X + c * Y;                     /* the face's own frame */
-            for (int side = -1; side <= 1; side += 2) {
-                float x = fx - side * EYE_X, y = fy - EYE_Y;
+            float y = fy - EYE_Y;
+            if (y >= -EYE_UP && y <= EYE_DOWN) for (int side = -1; side <= 1; side += 2) {
+                float x = fx - side * EYE_X;
                 if (x < -EYE_RX || x > EYE_RX) continue;
-                float k = 1 - (x / EYE_RX) * (x / EYE_RX);                     /* parabolas: pointed where they meet */
-                float top = -EYE_UP * k, lidtop = -EYE_UP + lid;
+                float q = x * (1.0f / EYE_RX), k = 1 - q * q;                  /* parabolas: pointed where they meet */
+                float top = -EYE_UP * k;
                 if (y < (top > lidtop ? top : lidtop) || y > EYE_DOWN * k) continue;
                 float dx = x - px, dy = y - py, r2 = dx * dx + dy * dy;
                 col = white[level];
@@ -2264,8 +2270,9 @@ static void eyes(void)
                 else if (r2 <= IRIS_R * IRIS_R) col = IRIS_COLOUR;
             }
             float ax = fabsf(fx);
-            if (ax <= MOUTH_W) {                                               /* the mouth: a parabola */
-                float yc = MOUTH_Y + MOUTH_CURVE * (float)mood * (1 - (ax / MOUTH_W) * (ax / MOUTH_W));
+            if (ax <= MOUTH_W && fabsf(fy - MOUTH_Y) <= MOUTH_CURVE + MOUTH_T) {   /* the mouth: a parabola */
+                float q = ax * (1.0f / MOUTH_W);
+                float yc = MOUTH_Y + MOUTH_CURVE * moodf * (1 - q * q);
                 if (fabsf(fy - yc) <= MOUTH_T / 2.0f) col = white[level];
             }
             scr_pixel(sx, sy, col);

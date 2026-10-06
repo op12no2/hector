@@ -2,7 +2,8 @@
  * hector.c - Hector the hexapod: 12 Waveshare SC09 bus servos via a
  * Waveshare Bus Servo Adapter (A) / USB serial. Started as a copy of
  * ../servo/servo.c (the generic servo tester) and keeps all its commands;
- * the hexapod commands (stand, legtest, ident, offset, calibrate, walk, set) are at the end.
+ * the hexapod commands (stand, sit, front, legtest, ident, offset, calibrate,
+ * walk, set, loads, imu, selftest) are at the end.
  *
  * Build:  make
  * Run:    ./hector [/dev/ttyACM0] [baud]
@@ -544,7 +545,8 @@ static int imu_init(void)
     return 0;
 }
 
-/* acceleration in g (+1 on z standing level) and rotation in deg/s, in the robot's axes: x forward, y left, z up */
+/* acceleration in g (+1 on z standing level) and rotation in deg/s, in the robot's axes:
+   x towards the gap between legs 1 and 2, y 90 degrees anticlockwise from it seen from above, z up */
 static int imu_read(double acc[3], double gyr[3])
 {
     unsigned char b[12];
@@ -930,7 +932,7 @@ static void help(void)
     "                          reads only: stand first to see what pushing on it does\n"
     "imu [secs]                stream the ATOM's IMU: acceleration, rotation and tilt (default 10 s, or until a key)\n"
     "selftest                  the startup checks again (reads only, nothing moves): servos, battery,\n"
-    "                          temperature, errors, overload settings, positions, load; on the ATOM's screen too");
+    "                          temperature, errors, overload settings, gains, positions, load; on the ATOM's screen too");
 }
 
 static int arg(char **tok, int i, int ntok, int dflt, int *ok)
@@ -1553,8 +1555,8 @@ static void loads(int secs)
 
 /*
  * Stream the IMU for secs seconds (or until a key), 50 lines a second: ms,
- * acceleration (g) and rotation (deg/s), x forward, y left, z up, and the
- * tilt from the first reading (deg). The screen shows the seconds.
+ * acceleration (g) and rotation (deg/s) in imu_read()'s axes, and the tilt
+ * from the first reading (deg). The screen shows the seconds.
  */
 static void imu_stream(int secs)
 {
@@ -1780,8 +1782,7 @@ static void ident(const int *ids, int nid)
  * one step at the end, after which each leg not already within 3 steps of
  * centre takes one more step, to centre.
  * A key (tty), `cycles` cycles or `secs` seconds (0: no limit) starts the stop;
- * ctrl-c freezes where it is
- * (SIGINT on the Pi, a byte on the ATOM).
+ * ctrl-c freezes where it is (SIGINT on the Pi, a byte on the ATOM).
  * Each tick also reads one servo's load, round robin, for a peak load report;
  * the reads note any status errors (overload), which print after the command.
  */
@@ -2122,7 +2123,8 @@ static int dispatch(char **tok, int nt)
 
 /*
  * ---- alive ----
- * What runs while the REPL waits for a key: alive() every ALIVE_MS. For now
+ * What runs while the REPL waits for a key: alive() every ALIVE_MS, which
+ * watches the servos (watch()) and the IMU (tips()) and draws
  * the face on the ATOM's screen: two eyes and a mouth, drawn turned so that
  * its mouth points at the walk's front (someone standing there sees it
  * upright, looking at them); when the front changes it turns there over about
@@ -2262,7 +2264,6 @@ static void eyes(void)
 #define WATCH_HOT     65
 #define WATCH_MISS    3         /* reads in a row with no reply */
 
-
 /* 1 if it printed (so the line being typed needs redrawing) */
 static int watch(void)
 {
@@ -2367,7 +2368,7 @@ static int watch(void)
     return printed;
 }
 
-/* wait ms, keeping the face going (it turns while the legs move) */
+/* wait ms, keeping the face going (so it can turn to a new front) */
 static void face_wait(int ms)
 {
     double end = now() + ms / 1000.0;
@@ -2376,8 +2377,6 @@ static void face_wait(int ms)
         msleep(ALIVE_MS);
     }
 }
-
-static void walk(int cycles, int str, int turn, double secs);
 
 /*
  * Tipped at pang (radians, imu_read()'s axes: the edge that was lifted): the
@@ -2451,7 +2450,6 @@ static int tips(void)
         fflush(stdout);
         return 1;
     }
-    eyes_dirty = 1;
     tip_walk(pang, peak);
     tips_relevel = 1;
     return 1;

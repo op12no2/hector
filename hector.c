@@ -914,7 +914,7 @@ static void help(void)
     "\n"
     "hexapod (leg n: hip id n, lift id n+6; layout and directions in legs[] in hector.c):\n"
     "stand [ms]                all feet down, hips centred, taking ms (default 1000)\n"
-    "front [1-6]               show or set the walk's front: gap k, between legs k and k+1 (a bow sets it too)\n"
+    "front [1-6]               show or set the walk's front: gap k, between legs k and k+1 (a tip sets it too)\n"
     "sit [ms]                  all lifts up to 1000, taking ms (default 1000): the body sits on the ground with the\n"
     "                          legs up inside it, no load on the servos; for switching off. stand gets up again\n"
     "legtest [1-6]             each leg in turn (or one, by hip id): up to 700, forward 80, back, down; the others stay put\n"
@@ -1230,7 +1230,6 @@ static const char *scr_what;                                  /* from scr_init()
 static int scr_ok;
 static int imu_st;                                            /* from imu_init() */
 static int standing;                                          /* stand ran last (not sit, or a frozen walk) */
-static int limp;                                              /* an all stop went limp: the face shows it until stand */
 static double t_shown;                                        /* the eyes show the self test's result until then */
 
 static void t_draw(const struct t_line *l, int n, int y)
@@ -1581,44 +1580,34 @@ static void imu_stream(int secs)
 }
 
 /*
- * Bowing, from alive() while it's standing (tips(), below): tip it up at an
- * edge and put it down, and it bows towards that edge. Level is the IMU's
- * reading taken BOW_LEVEL_MS after a stand or a command. A tilt of over
- * BOW_TIP_ON degrees from level is a tip, and its direction at the biggest
- * tilt is kept, counting only samples where the total acceleration is within
- * BOW_STILL of level's (putting it down jolts it, with spikes bigger than the
- * tilt, any way). Sliding it along reads as a tilt too (the accelerometer
- * can't tell acceleration from tilt: a slide is a push of about 0.1 g for
- * 0.3-0.5 s, 5-6 degrees, then a sharper stop the other way), so a tip also
- * needs the gyro's rotation about horizontal axes, added up to the biggest
- * tilt, to be at least BOW_ROT of that tilt (a tip rotates it as far as it
- * tilts; a slide, about 1 degree), and the tilt held over BOW_TIP_ON for
- * BOW_TIPPED_MS. Once it has been back under BOW_TIP_OFF for BOW_SETTLE_MS
- * (put down and still), it bows: the lifts of the two legs either side of that
- * way (leg k, hip id k, points at 30 - 60 (k - 1) degrees in imu_read()'s
- * axes: the legs go clockwise from the 1-2 gap) go to BOW_POS over BOW_MS (as
- * "move 7-8 700 1000" for legs 1 and 2), so that edge of the body comes down
- * (it's designed to land safely); it holds BOW_HOLD_MS, stands, and takes
- * level again. The eyes then look that way.
+ * Tipped, from alive() while it's standing (tips(), below): lift it at an
+ * edge and put it down, and it walks away from that edge (away from whoever
+ * lifted it) for TIP_WALK_S seconds. Level is the IMU's reading taken
+ * TIP_LEVEL_MS after a stand or a command. A tilt of over TIP_ON degrees
+ * from level is a tip, and its direction at the biggest tilt is kept,
+ * counting only samples where the total acceleration is within TIP_STILL of
+ * level's (putting it down jolts it, with spikes bigger than the tilt, any
+ * way). Sliding it along reads as a tilt too (the accelerometer can't tell
+ * acceleration from tilt: a slide is a push of about 0.1 g for 0.3-0.5 s,
+ * 5-6 degrees, then a sharper stop the other way), so a tip also needs the
+ * gyro's rotation about horizontal axes, added up to the biggest tilt, to be
+ * at least TIP_ROT of that tilt (a tip rotates it as far as it tilts; a
+ * slide, about 1 degree), and the tilt held over TIP_ON for TIP_HELD_MS;
+ * anything else is ignored. Once it has been back under TIP_OFF for
+ * TIP_SETTLE_MS (put down and still), the gap opposite the lifted edge
+ * becomes the front, the face turns there, and it walks.
  */
-#define BOW_TIP_ON    3.0     /* deg */
-#define BOW_TIP_OFF   1.5
-#define BOW_SETTLE_MS 300
-#define BOW_STILL     0.05    /* g */
-#define BOW_LEVEL_MS  300
-#define BOW_ROT       0.5     /* a tip's rotation (gyro, added up) is about its tilt; a slide's is a fraction */
-#define SLIDE_ROT     0.3     /* a push: rotation under this fraction of its "tilt"... */
-#define SLIDE_MIN     5.0     /* ...of at least this many degrees */
-#define SLIDE_PRE_MS  400     /* a push is added up from this long before it showed as a tilt (a gentle push doesn't) */
-#define SLIDE_DEAD    0.015   /* g: less is taken as nothing, so noise doesn't add up */
-#define SLIDE_HIST    128     /* the last 2.5 s of horizontal acceleration */
-#define BOW_TIPPED_MS 250     /* over BOW_TIP_ON at least this long */
-#define BOW_POS       700     /* the near lifts' position, as move's (the offset is added) */
-#define BOW_MS        1000    /* to get there, and to stand again */
-#define BOW_HOLD_MS   500     /* bowed, before standing */
+#define TIP_ON        3.0     /* deg */
+#define TIP_OFF       1.5
+#define TIP_SETTLE_MS 300
+#define TIP_STILL     0.05    /* g */
+#define TIP_LEVEL_MS  300
+#define TIP_ROT       0.5     /* a tip's rotation (gyro, added up) is about its tilt; a slide's is a fraction */
+#define TIP_HELD_MS   250     /* over TIP_ON at least this long */
+#define TIP_WALK_S    5       /* how long it walks (until the stop begins), fixed for now */
 
 /* the IMU's acceleration averaged over ms, as the level reference */
-static int bow_level(double a0[3], int ms)
+static int imu_level(double a0[3], int ms)
 {
     double a[3], g[3];
     int n = 0;
@@ -1632,15 +1621,11 @@ static int bow_level(double a0[3], int ms)
     return 0;
 }
 
-/* where leg (hip id) k points, radians, in imu_read()'s axes */
-static double leg_ang(int k) { return (30 - 60 * (k - 1)) * M_PI / 180; }
-
 /* all feet down, hips centred, taking ms */
 static int stand(int ms)
 {
     if (check_servos()) return -1;
-    limp = 0;
-    write_u8(BROADCAST, REG_TORQUE_ENABLE, 1);          /* torque on, all twelve in one packet: an all stop leaves it off */
+    write_u8(BROADCAST, REG_TORQUE_ENABLE, 1);          /* torque on, all twelve in one packet */
     for (int i = 0; i < 6; i++) legs[i].x = legs[i].z = 0;
     send_pose(ms);
     msleep(ms + 200);
@@ -1794,37 +1779,13 @@ static void ident(const int *ids, int nid)
  * cycle (so the legs that step last aren't dragged too far back) and falls over
  * one step at the end, after which each leg not already within 3 steps of
  * centre takes one more step, to centre.
- * A key (tty) or `cycles` cycles starts the stop; ctrl-c freezes where it is
+ * A key (tty), `cycles` cycles or `secs` seconds (0: no limit) starts the stop;
+ * ctrl-c freezes where it is
  * (SIGINT on the Pi, a byte on the ATOM).
  * Each tick also reads one servo's load, round robin, for a peak load report;
  * the reads note any status errors (overload), which print after the command.
  */
-/*
- * All stop: while walking, a servo's load over STOP_LOAD (a leg pushing on
- * something: walking peaks have been about 30%), no lift over LIFTED_LOAD for
- * a whole round of reads (picked up: on the ground, a walk's stance legs carry
- * 15-30%), or the body rotating faster than STOP_GYRO or jolted by more than
- * STOP_JOLT (knocked or grabbed: a tripod walk itself reaches about 40 deg/s
- * and 0.3 g), and it goes limp, torque off on all twelve, so nothing stays
- * pressed on a hand. The body settles onto its base (it's made to); the face
- * says so (limp) until stand gets it up again.
- */
-#define STOP_LOAD   500         /* 0.1% */
-#define LIFTED_LOAD 30
-#define LIFTED_ROUNDS 2         /* rounds of 12 reads in a row with no lift over LIFTED_LOAD: one could straddle a tripod changeover */
-#define STOP_GYRO   120.0       /* deg/s */
-#define STOP_JOLT   1.0         /* g from 1 */
-
-static void go_limp(const char *why)
-{
-    limp = 1;
-    write_u8(BROADCAST, REG_TORQUE_ENABLE, 0);         /* all twelve at once, in one packet (no replies to wait for) */
-    standing = 0;
-    printf("\nall stop: %s; limp (stand gets up again)\n", why);
-    fflush(stdout);
-}
-
-static void walk(int cycles, int str, int turn)
+static void walk(int cycles, int str, int turn, double secs)
 {
     const struct gait *g = &gaits[gait];
     double period = step_ms / 1000.0 / g->swing, stance = period - step_ms / 1000.0;
@@ -1847,10 +1808,8 @@ static void walk(int cycles, int str, int turn)
     printf("walking: %s, %.1f s cycle, stride %d, turn %d, lift %d; %sctrl-c freezes\n",
            g->name, period, str, turn, lift, tty ? "any key stops, " : "");
     fflush(stdout);
-    double phase = 0, r = 0, t = now(), gmax = 0, jmax = 0;
-    int lift_max = 0, lifted_ok = 0, quiet = 0;    /* the most load on any lift this round of 12 reads; any yet since the walk began; rounds with none */
+    double phase = 0, r = 0, t = now(), t0 = t;
     int stopping = 0;
-    char stop_why[64] = "";
     tick_start();
     while (nsettled < 6) {
         tick_wait(TICK_MS);
@@ -1862,7 +1821,7 @@ static void walk(int cycles, int str, int turn)
         if (dt > 0.1) dt = 0.1;                 /* a stall: slow the gait, don't jump it */
         if (dt > 2 * TICK_MS / 1000.0) tick_start();    /* fell behind: don't burst to catch up */
 
-        if (!stopping && (c >= 0 || (cycles && phase >= cycles))) {
+        if (!stopping && (c >= 0 || (cycles && phase >= cycles) || (secs > 0 && t - t0 >= secs))) {
             stopping = 1;
             puts("stopping");
             fflush(stdout);
@@ -1896,28 +1855,11 @@ static void walk(int cycles, int str, int turn)
         int id = tick % 12 < 6 ? legs[tick % 12].hip : legs[tick % 12 - 6].lift, ld = 0;
         if (read_u16(id, REG_PRESENT_LOAD, &ld) == 0 && (ld & 0x3FF) > peak[tick % 12]) peak[tick % 12] = ld & 0x3FF;
         tick++;
-        if ((ld & 0x3FF) > STOP_LOAD) snprintf(stop_why, sizeof stop_why, "servo %d at %d%% load", id, (ld & 0x3FF) / 10);
-        if ((tick - 1) % 12 >= 6 && (ld & 0x3FF) > lift_max) lift_max = ld & 0x3FF;     /* that read was a lift */
-        if (tick % 12 == 0) {                   /* a round done: was anything standing on the ground? */
-            if (lift_max > LIFTED_LOAD) { lifted_ok = 1; quiet = 0; }
-            else if (lifted_ok && ++quiet >= LIFTED_ROUNDS) snprintf(stop_why, sizeof stop_why, "no weight on any foot (picked up?)");
-            lift_max = 0;
-        }
-        double a[3], gy[3];
-        if (imu_st == 0 && imu_read(a, gy) == 0) {
-            double gm = sqrt(gy[0] * gy[0] + gy[1] * gy[1] + gy[2] * gy[2]), jm = fabs(sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]) - 1);
-            if (gm > gmax) gmax = gm;
-            if (jm > jmax) jmax = jm;
-            if (gm > STOP_GYRO) snprintf(stop_why, sizeof stop_why, "turned at %.0f deg/s", gm);
-            if (jm > STOP_JOLT) snprintf(stop_why, sizeof stop_why, "jolted by %.2f g", jm);
-        }
-        if (*stop_why) break;
     }
 
     sigint_restore();
     if (tty) { con_drop(); con_restore(); }    /* drop extra keys, not into the next line */
-    if (*stop_why) go_limp(stop_why);
-    else if (halted) { puts("\nhalted, holding this pose (stand puts all feet down)"); standing = 0; }
+    if (halted) { puts("\nhalted, holding this pose (stand puts all feet down)"); standing = 0; }
     else {
         for (int i = 0; i < 6; i++) legs[i].x = legs[i].z = 0;    /* tidy the last fraction of a step */
         send_pose(200);
@@ -1928,7 +1870,6 @@ static void walk(int cycles, int str, int turn)
     printf("peak load %% (a servo over 80%% for 4 s drops to 20%%):");
     for (int k = 0; k < 12; k++) printf(" %d:%d", k < 6 ? legs[k].hip : legs[k - 6].lift, (peak[k] + 5) / 10);
     putchar('\n');
-    if (imu_st == 0) printf("most rotation %.0f deg/s, most jolt %.2f g (all stop at %.0f, %.2f)\n", gmax, jmax, STOP_GYRO, STOP_JOLT);
 }
 
 /* run one tokenised command; returns 1 on quit */
@@ -2091,7 +2032,7 @@ static int run(char **tok, int nt)
             printf("usage: walk [cycles] [stride -%d..%d] [turn -%d..%d]\n", HIP_MAX, HIP_MAX, HIP_MAX, HIP_MAX);
             return 0;
         }
-        walk(cycles, str, turn);
+        walk(cycles, str, turn, 0);
     }
     else if (!strcmp(c, "selftest")) selftest();
     else if (!strcmp(c, "loads")) loads(arg(tok, 1, nt, 10, NULL));
@@ -2255,11 +2196,10 @@ static void eyes(void)
     double d = remainder(target - beta, 2 * M_PI);
     if (fabs(d) > 0.003) { beta += fabs(d) < 0.02 ? d : d * 0.15; eyes_dirty = 1; }
 
-    /* the status: the self test's for a while after it, then the watch's; limp (all stop) if nothing worse */
+    /* the status: the self test's for a while after it, then the watch's */
     int level = w_level;
     const char *text = w_text;
     if (t < t_shown || !w_swept) { level = t_worst; text = t_nbad ? t_bad[0].s : ""; }
-    if (limp && level < T_WARN) { level = T_WARN; text = "limp"; }
     static int last_level = -1;
     static char last_text[16];
     if (level != last_level || strcmp(text, last_text)) {
@@ -2274,7 +2214,6 @@ static void eyes(void)
     double want = level == T_OK ? 1 : level == T_WARN ? 0 : -1;
     if (fabs(want - mood) > 0.01) { mood += fabs(want - mood) < 0.05 ? want - mood : (want - mood) * 0.1; eyes_dirty = 1; }
 
-    if (limp && open > 0.45) open = 0.45;      /* sleepy until it's stood up */
     int lid = (int)lround((EYE_UP + EYE_DOWN) * (1 - open)), px = (int)lround(cx * LOOK_X), py = (int)lround(cy * LOOK_Y);
     if (!eyes_dirty && lid == last_open && px == last_px && py == last_py) return;
     eyes_dirty = 0; last_open = lid; last_px = px; last_py = py;
@@ -2438,96 +2377,28 @@ static void face_wait(int ms)
     }
 }
 
+static void walk(int cycles, int str, int turn, double secs);
+
 /*
- * Before it moves after a tip or a push: the face turns to the new front (the
- * cue), and it waits until it has been still, no tilt over HANDS_TILT from
- * where it was as the wait began (a push may have left it on a slightly
- * different slope) and no rotation over HANDS_GYRO, for HANDS_OFF_MS.
- * Touched again in that time, it doesn't move: -1.
+ * Tipped at pang (radians, imu_read()'s axes: the edge that was lifted): the
+ * gap nearest the opposite way becomes the front, the face turns there, and
+ * it walks that way with the current gait and stride for TIP_WALK_S seconds.
  */
-#define HANDS_OFF_MS 1500
-#define HANDS_TILT   1.5        /* deg */
-#define HANDS_GYRO   4.0        /* deg/s */
-
-static int hands_off(void)
+static void tip_walk(double pang, double peak)
 {
-    double end = now() + HANDS_OFF_MS / 1000.0, a[3], g[3], a0[3];
-    if (bow_level(a0, 100)) return 0;
-    while (now() < end) {
-        if (scr_what) eyes();
-        msleep(ALIVE_MS);
-        if (imu_read(a, g)) continue;
-        double tilt = asin(clampd(hypot(a[0] - a0[0], a[1] - a0[1]), 0, 1)) * 180 / M_PI;
-        if (tilt > HANDS_TILT || sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]) > HANDS_GYRO) {
-            printf("      touched again: not moving\n");
-            fflush(stdout);
-            return -1;
-        }
-    }
-    return 0;
-}
-
-/* bow towards pang (radians, imu_read()'s axes), then stand again */
-static void bow_to(double pang, double peak)
-{
-    double c[6];
-    int n1 = 0, n2 = 1;
-    for (int i = 0; i < 6; i++) c[i] = cos(leg_ang(legs[i].hip) - pang);
-    for (int i = 0; i < 6; i++) if (c[i] > c[n1]) n1 = i;
-    if (n2 == n1) n2 = 0;
-    for (int i = 0; i < 6; i++) if (i != n1 && c[i] > c[n2]) n2 = i;
-    int lo = legs[n1].hip < legs[n2].hip ? n1 : n2, hi = lo == n1 ? n2 : n1;
-    printf("\r\x1b[Ktipped %.1f deg towards %.0f deg: bowing on legs %d+%d (lifts %d, %d)\n", peak, pang * 180 / M_PI,
-           legs[lo].hip, legs[hi].hip, legs[lo].lift, legs[hi].lift);
+    double away = pang + M_PI;
+    int k = ((int)lround(-away * 180 / M_PI / 60) % 6 + 6) % 6 + 1;     /* gap k at -60 (k - 1) degrees */
+    printf("\r\x1b[Ktipped %.1f deg, lifted at %.0f deg: walking away for %d s, towards gap %d (legs %d and %d)\n",
+           peak, pang * 180 / M_PI, TIP_WALK_S, k, k, k % 6 + 1);
     fflush(stdout);
-    /* that gap is now the front, and the face turns to it; then hands off */
-    int k = legs[hi].hip - legs[lo].hip == 1 ? legs[lo].hip : legs[hi].hip;     /* gap k is legs k and k+1; 6 and 1 is 6 */
-    int was = front;
     set_front(k);
-    if (hands_off()) { set_front(was); return; }
-    printf("      the front is now gap %d (legs %d and %d)\n", k, k, k % 6 + 1);
-    /* z for a lift position of BOW_POS + offset, as leg_goals() works it out */
-    legs[n1].z = height + legs[n1].lift_dir * (BOW_POS - CENTRE);
-    legs[n2].z = height + legs[n2].lift_dir * (BOW_POS - CENTRE);
-    send_pose(BOW_MS);
-    face_wait(BOW_MS + BOW_HOLD_MS);
-    stand(BOW_MS);
+    face_wait(700);                     /* the face turns first */
+    walk(0, stride, 0, TIP_WALK_S);
 }
 
 /*
- * Pushed (slid along the desk): it walks on the way it was pushed. The front
- * becomes the gap nearest that way, the face turns there, then it walks with
- * the current gait: PUSH_CYCLES cycles for a short push (under PUSH_SHORT
- * cm), twice that for a medium one (under PUSH_LONG), three times for a long
- * one. Its way and distance come
- * from adding up the horizontal acceleration twice, from SLIDE_PRE_MS before
- * it first showed as a tilt (a gentle push only crosses BOW_TIP_ON at its
- * sharper stop, which points the other way): the way it moved, not its first
- * jolt. Rough (perhaps +-50% on distance) but it tells short from long.
- */
-#define PUSH_SHORT  6.0
-#define PUSH_LONG   12.0
-#define PUSH_CYCLES 2           /* 1 was too short (the user, 2026-10-05) */
-
-static void walk(int cycles, int str, int turn);
-
-static void push_to(double ang, double cm, double peak, double rot)
-{
-    int k = ((int)lround(-ang * 180 / M_PI / 60) % 6 + 6) % 6 + 1;     /* gap k at -60 (k - 1) degrees */
-    int cycles = PUSH_CYCLES * (cm < PUSH_SHORT ? 1 : cm < PUSH_LONG ? 2 : 3);
-    printf("\r\x1b[Kpushed towards %.0f deg, about %.0f cm (%.1f deg of 'tilt', %.1f of rotation): walking %d cycle%s towards gap %d\n",
-           ang * 180 / M_PI, cm, peak, rot, cycles, cycles > 1 ? "s" : "", k);
-    fflush(stdout);
-    int was = front;
-    set_front(k);                       /* the face turns first */
-    if (hands_off()) { set_front(was); return; }
-    walk(cycles, stride, 0);
-}
-
-/*
- * The IMU, from alive() while it's standing: tips (above, at bow_to), pushes
- * (push_to) and being knocked over (gravity off z, under 0.5 g, for a second:
- * it sits).
+ * The IMU, from alive() while it's standing: tips (tip_walk, above) and being
+ * knocked over (gravity off z, under 0.5 g, for a second: it sits).
  * 1 if it printed.
  */
 static int tips_relevel = 1;    /* take level again: after a command, which may have moved it */
@@ -2535,14 +2406,11 @@ static int tips_relevel = 1;    /* take level again: after a command, which may 
 static int tips(void)
 {
     static double a0[3], peak, pang, still_since, over_since, rot, rot_at_peak, tipped_ms, last_t;
-    static double t_start;
-    static struct { double t, x, y; } hist[SLIDE_HIST];       /* horizontal acceleration from level, g */
-    static int nhist;
     static int state;           /* 0 waiting for a tip, 1 tipped */
     double a[3], g[3];
     if (!standing || imu_st != 0) { tips_relevel = 1; return 0; }
     if (tips_relevel) {
-        if (bow_level(a0, BOW_LEVEL_MS)) return 0;
+        if (imu_level(a0, TIP_LEVEL_MS)) return 0;
         tips_relevel = 0;
         state = 0;
         over_since = 0;
@@ -2565,47 +2433,26 @@ static int tips(void)
     double tilt = asin(clampd(hypot(dx, dy), 0, 1)) * 180 / M_PI;
     double dt = last_t ? t - last_t : 0;
     last_t = t;
-    hist[nhist % SLIDE_HIST].t = t;
-    hist[nhist % SLIDE_HIST].x = dx;
-    hist[nhist % SLIDE_HIST].y = dy;
-    nhist++;
     if (state == 0) {
-        if (tilt > BOW_TIP_ON) { state = 1; peak = 0; still_since = 0; rot = rot_at_peak = 0; tipped_ms = 0; t_start = t; }
+        if (tilt > TIP_ON) { state = 1; peak = 0; still_since = 0; rot = rot_at_peak = 0; tipped_ms = 0; }
         return 0;
     }
     rot += hypot(g[0], g[1]) * dt;
-    if (tilt > BOW_TIP_ON) tipped_ms += dt * 1000;
+    if (tilt > TIP_ON) tipped_ms += dt * 1000;
     double na = sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]), n0 = sqrt(a0[0] * a0[0] + a0[1] * a0[1] + a0[2] * a0[2]);
-    if (tilt > peak && fabs(na - n0) < BOW_STILL) { peak = tilt; pang = atan2(dy, dx); rot_at_peak = rot; }
-    if (tilt >= BOW_TIP_OFF) { still_since = 0; return 0; }
+    if (tilt > peak && fabs(na - n0) < TIP_STILL) { peak = tilt; pang = atan2(dy, dx); rot_at_peak = rot; }
+    if (tilt >= TIP_OFF) { still_since = 0; return 0; }
     if (!still_since) still_since = t;
-    if ((t - still_since) * 1000 < BOW_SETTLE_MS) return 0;
+    if ((t - still_since) * 1000 < TIP_SETTLE_MS) return 0;
     state = 0;
-    if (peak < BOW_TIP_ON) return 0;    /* only jolts: not a tip */
-    if (rot_at_peak < SLIDE_ROT * peak && peak >= SLIDE_MIN) {
-        /* where it went: the acceleration added up twice, from a little before it showed */
-        double vx = 0, vy = 0, sx = 0, sy = 0, tp = 0;
-        for (int n = nhist > SLIDE_HIST ? nhist - SLIDE_HIST : 0; n < nhist; n++) {
-            double ht = hist[n % SLIDE_HIST].t, hx = hist[n % SLIDE_HIST].x, hy = hist[n % SLIDE_HIST].y;
-            if (ht < t_start - SLIDE_PRE_MS / 1000.0) continue;
-            if (tp) {
-                double d = ht - tp;
-                if (hypot(hx, hy) > SLIDE_DEAD) { vx += hx * 9.81 * d; vy += hy * 9.81 * d; }
-                sx += vx * d; sy += vy * d;
-            }
-            tp = ht;
-        }
-        push_to(atan2(sy, sx), hypot(sx, sy) * 100, peak, rot_at_peak);
-        tips_relevel = 1;
-        return 1;
-    }
-    if (rot_at_peak < BOW_ROT * peak || tipped_ms < BOW_TIPPED_MS) {
+    if (peak < TIP_ON) return 0;    /* only jolts: not a tip */
+    if (rot_at_peak < TIP_ROT * peak || tipped_ms < TIP_HELD_MS) {
         printf("\r\x1b[Knot a tip: %.1f deg for %.0f ms, but it rotated only %.1f deg (slid?)\n", peak, tipped_ms, rot_at_peak);
         fflush(stdout);
         return 1;
     }
     eyes_dirty = 1;
-    bow_to(pang, peak);
+    tip_walk(pang, peak);
     tips_relevel = 1;
     return 1;
 }

@@ -1791,7 +1791,8 @@ static void ident(const int *ids, int nid)
  * at this height: then it only checks the servos and starts (the tip walk).
  * The face keeps going while it walks (it turns to a new front, blinks),
  * drawn on one tick and sent on the next (eyes_split) so neither takes much
- * of a tick; the longest tick is reported, to show if anything did.
+ * of a tick; the longest tick, how many were late and the face's longest
+ * call are reported, to show if anything did.
  */
 static void eyes(void);
 static int eyes_split;          /* eyes() draws on one call and sends on the next */
@@ -1819,8 +1820,8 @@ static void walk(int cycles, int str, int turn, double secs, int quick)
     printf("walking: %s, %.1f s cycle, stride %d, turn %d, lift %d; %sctrl-c freezes\n",
            g->name, period, str, turn, lift, tty ? "any key stops, " : "");
     fflush(stdout);
-    double phase = 0, r = 0, t = now(), t0 = t, dtmax = 0;
-    int stopping = 0;
+    double phase = 0, r = 0, t = now(), t0 = t, dtmax = 0, facemax = 0;
+    int stopping = 0, nlate = 0;
     eyes_split = 1;
     tick_start();
     while (nsettled < 6) {
@@ -1831,6 +1832,7 @@ static void walk(int cycles, int str, int turn, double secs, int quick)
         double t1 = now(), dt = t1 - t;
         t = t1;
         if (dt > dtmax) dtmax = dt;
+        if (dt > 1.25 * TICK_MS / 1000.0) nlate++;
         if (dt > 0.1) dt = 0.1;                 /* a stall: slow the gait, don't jump it */
         if (dt > 2 * TICK_MS / 1000.0) tick_start();    /* fell behind: don't burst to catch up */
 
@@ -1868,7 +1870,11 @@ static void walk(int cycles, int str, int turn, double secs, int quick)
         int id = tick % 12 < 6 ? legs[tick % 12].hip : legs[tick % 12 - 6].lift, ld = 0;
         if (read_u16(id, REG_PRESENT_LOAD, &ld) == 0 && (ld & 0x3FF) > peak[tick % 12]) peak[tick % 12] = ld & 0x3FF;
         tick++;
-        if (scr_what) eyes();
+        if (scr_what) {
+            double e0 = now();
+            eyes();
+            if (now() - e0 > facemax) facemax = now() - e0;
+        }
     }
 
     eyes_split = 0;
@@ -1885,7 +1891,9 @@ static void walk(int cycles, int str, int turn, double secs, int quick)
     printf("peak load %% (a servo over 80%% for 4 s drops to 20%%):");
     for (int k = 0; k < 12; k++) printf(" %d:%d", k < 6 ? legs[k].hip : legs[k - 6].lift, (peak[k] + 5) / 10);
     putchar('\n');
-    printf("longest tick %.0f ms (of %d)\n", dtmax * 1000, TICK_MS);
+    printf("longest tick %.0f ms (of %d), %d of %d over %d ms", dtmax * 1000, TICK_MS, nlate, tick, TICK_MS * 5 / 4);
+    if (scr_what) printf("; the face took up to %.0f ms of one", facemax * 1000);
+    putchar('\n');
 }
 
 /* run one tokenised command; returns 1 on quit */

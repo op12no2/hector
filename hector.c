@@ -1597,8 +1597,10 @@ static void imu_stream(int secs)
  * at least TIP_ROT of that tilt (a tip rotates it as far as it tilts; a
  * slide, about 1 degree), and the tilt held over TIP_ON for TIP_HELD_MS;
  * anything else is ignored. Once it has been back under TIP_OFF for
- * TIP_SETTLE_MS (put down and still), the gap opposite the lifted edge
- * becomes the front and it walks, the face turning there as it goes.
+ * TIP_SETTLE_MS (put down and still) it walks towards the gap opposite the
+ * lifted edge. That gap becomes the front as soon as the lift passes those
+ * tests, while it is still in the hand, so the face turns there before the
+ * walk (and back, if it turns out not to be a tip).
  */
 #define TIP_ON        3.0     /* deg */
 #define TIP_OFF       1.5
@@ -1789,14 +1791,9 @@ static void ident(const int *ids, int nid)
  * the reads note any status errors (overload), which print after the command.
  * It stands first, taking a second, unless `quick` and it's already standing
  * at this height: then it only checks the servos and starts (the tip walk).
- * The face keeps going while it walks (it turns to a new front, blinks),
- * drawn on one tick and sent on the next (eyes_split) so neither takes much
- * of a tick; the longest tick, how many were late and the face's longest
- * call are reported, to show if anything did.
+ * Nothing is drawn while it walks (a frame of the face is most of a tick);
+ * the longest tick and how many were late are reported.
  */
-static void eyes(void);
-static int eyes_split;          /* eyes() draws on one call and sends on the next */
-
 static void walk(int cycles, int str, int turn, double secs, int quick)
 {
     const struct gait *g = &gaits[gait];
@@ -1820,9 +1817,8 @@ static void walk(int cycles, int str, int turn, double secs, int quick)
     printf("walking: %s, %.1f s cycle, stride %d, turn %d, lift %d; %sctrl-c freezes\n",
            g->name, period, str, turn, lift, tty ? "any key stops, " : "");
     fflush(stdout);
-    double phase = 0, r = 0, t = now(), t0 = t, dtmax = 0, facemax = 0;
+    double phase = 0, r = 0, t = now(), t0 = t, dtmax = 0;
     int stopping = 0, nlate = 0;
-    eyes_split = 1;
     tick_start();
     while (nsettled < 6) {
         tick_wait(TICK_MS);
@@ -1870,14 +1866,8 @@ static void walk(int cycles, int str, int turn, double secs, int quick)
         int id = tick % 12 < 6 ? legs[tick % 12].hip : legs[tick % 12 - 6].lift, ld = 0;
         if (read_u16(id, REG_PRESENT_LOAD, &ld) == 0 && (ld & 0x3FF) > peak[tick % 12]) peak[tick % 12] = ld & 0x3FF;
         tick++;
-        if (scr_what) {
-            double e0 = now();
-            eyes();
-            if (now() - e0 > facemax) facemax = now() - e0;
-        }
     }
 
-    eyes_split = 0;
     sigint_restore();
     if (tty) { con_drop(); con_restore(); }    /* drop extra keys, not into the next line */
     if (halted) { puts("\nhalted, holding this pose (stand puts all feet down)"); standing = 0; }
@@ -1891,9 +1881,7 @@ static void walk(int cycles, int str, int turn, double secs, int quick)
     printf("peak load %% (a servo over 80%% for 4 s drops to 20%%):");
     for (int k = 0; k < 12; k++) printf(" %d:%d", k < 6 ? legs[k].hip : legs[k - 6].lift, (peak[k] + 5) / 10);
     putchar('\n');
-    printf("longest tick %.0f ms (of %d), %d of %d over %d ms", dtmax * 1000, TICK_MS, nlate, tick, TICK_MS * 5 / 4);
-    if (scr_what) printf("; the face took up to %.0f ms of one", facemax * 1000);
-    putchar('\n');
+    printf("longest tick %.0f ms (of %d), %d of %d over %d ms\n", dtmax * 1000, TICK_MS, nlate, tick, TICK_MS * 5 / 4);
 }
 
 /* run one tokenised command; returns 1 on quit */
@@ -2177,8 +2165,10 @@ static int dispatch(char **tok, int nt)
 #define MOUTH_CURVE 8           /* how far its middle drops below the corners at mood +1 (rises at -1) */
 #define MOUTH_T  4              /* its thickness */
 #define MOUTH_AT_FRONT 1        /* 0: the face's top points at the front instead */
+#define FACE_TURN 0.3           /* of what's left of a turn, each frame */
 
 static int eyes_dirty = 1;      /* redraw: something else used the screen */
+static int face_snap;           /* the next eyes() turns the face all the way at once */
 
 /* the servo watch's state (watch(), below): per servo, and the worst problem now */
 static struct { int volt, temp, load, err, miss; double hi_since; } w_servo[12];
@@ -2190,8 +2180,7 @@ static double frand(double lo, double hi) { return lo + (hi - lo) * rand() / (do
 static void eyes(void)
 {
     static double next_blink, blink_t0 = -1, next_glance, glance_until, gx, gy, cx, cy, beta = 99;
-    static int last_open = -1, last_px = 999, last_py = 999, unsent;
-    if (unsent) { scr_show(); unsent = 0; return; }     /* drawn on the last call */
+    static int last_open = -1, last_px = 999, last_py = 999;
     double t = now();
     if (!next_blink) { next_blink = t + frand(2, 5); next_glance = t + frand(4, 9); }
 
@@ -2220,7 +2209,8 @@ static void eyes(void)
     double target = atan2(-cos(f - r), -cos(f - u)) + (MOUTH_AT_FRONT ? 0 : M_PI);
     if (beta > 50) beta = target;
     double d = remainder(target - beta, 2 * M_PI);
-    if (fabs(d) > 0.003) { beta += fabs(d) < 0.02 ? d : d * 0.15; eyes_dirty = 1; }
+    if (fabs(d) > 0.003) { beta += fabs(d) < 0.02 || face_snap ? d : d * FACE_TURN; eyes_dirty = 1; }
+    face_snap = 0;
 
     /* the status: the self test's for a while after it, then the watch's */
     int level = w_level;
@@ -2278,8 +2268,7 @@ static void eyes(void)
             scr_pixel(sx, sy, col);
         }
     if (*text) scr_text(4, 108, 2, t_colour[level], text);
-    if (eyes_split) unsent = 1;
-    else scr_show();
+    scr_show();
 }
 
 /*
@@ -2400,20 +2389,27 @@ static int watch(void)
     return printed;
 }
 
+/* the gap to walk towards after a tip at pang (radians, imu_read()'s axes: the edge that was lifted): the one opposite */
+static int tip_gap(double pang)
+{
+    return ((int)lround(-(pang + M_PI) * 180 / M_PI / 60) % 6 + 6) % 6 + 1;     /* gap k is at -60 (k - 1) degrees */
+}
+
 /*
- * Tipped at pang (radians, imu_read()'s axes: the edge that was lifted): the
- * gap nearest the opposite way becomes the front and it walks that way with
- * the current gait and stride for TIP_WALK_S seconds, starting at once (it's
- * standing already); the face turns to the new front as it goes.
+ * Tipped at pang and put down again: the gap opposite is the front (tips()
+ * set it while it was lifted, so the face has turned or nearly; it's turned
+ * the rest of the way at once, as nothing is drawn during a walk), and it
+ * walks that way with the current gait and stride for TIP_WALK_S seconds,
+ * starting straight away (it's standing already).
  */
 static void tip_walk(double pang, double peak)
 {
-    double away = pang + M_PI;
-    int k = ((int)lround(-away * 180 / M_PI / 60) % 6 + 6) % 6 + 1;     /* gap k at -60 (k - 1) degrees */
+    int k = tip_gap(pang);
     printf("\r\x1b[Ktipped %.1f deg, lifted at %.0f deg: walking away for %d s, towards gap %d (legs %d and %d)\n",
            peak, pang * 180 / M_PI, TIP_WALK_S, k, k, k % 6 + 1);
     fflush(stdout);
     set_front(k);
+    if (scr_what) { face_snap = 1; eyes(); }
     walk(0, stride, 0, TIP_WALK_S, 1);
 }
 
@@ -2428,6 +2424,7 @@ static int tips(void)
 {
     static double a0[3], peak, pang, still_since, over_since, rot, rot_at_peak, tipped_ms, last_t;
     static int state;           /* 0 waiting for a tip, 1 tipped */
+    static int front0;          /* the front as the tip began */
     double a[3], g[3];
     if (!standing || imu_st != 0) { tips_relevel = 1; return 0; }
     if (tips_relevel) {
@@ -2455,19 +2452,22 @@ static int tips(void)
     double dt = last_t ? t - last_t : 0;
     last_t = t;
     if (state == 0) {
-        if (tilt > TIP_ON) { state = 1; peak = 0; still_since = 0; rot = rot_at_peak = 0; tipped_ms = 0; }
+        if (tilt > TIP_ON) { state = 1; peak = 0; still_since = 0; rot = rot_at_peak = 0; tipped_ms = 0; front0 = front; }
         return 0;
     }
     rot += hypot(g[0], g[1]) * dt;
     if (tilt > TIP_ON) tipped_ms += dt * 1000;
     double na = sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]), n0 = sqrt(a0[0] * a0[0] + a0[1] * a0[1] + a0[2] * a0[2]);
     if (tilt > peak && fabs(na - n0) < TIP_STILL) { peak = tilt; pang = atan2(dy, dx); rot_at_peak = rot; }
+    int tip = peak >= TIP_ON && rot_at_peak >= TIP_ROT * peak && tipped_ms >= TIP_HELD_MS;
+    if (tip && tip_gap(pang) != front) set_front(tip_gap(pang));    /* still lifted: the face turns to where it will go */
     if (tilt >= TIP_OFF) { still_since = 0; return 0; }
     if (!still_since) still_since = t;
     if ((t - still_since) * 1000 < TIP_SETTLE_MS) return 0;
     state = 0;
+    if (!tip && front != front0) set_front(front0);
     if (peak < TIP_ON) return 0;    /* only jolts: not a tip */
-    if (rot_at_peak < TIP_ROT * peak || tipped_ms < TIP_HELD_MS) {
+    if (!tip) {
         printf("\r\x1b[Knot a tip: %.1f deg for %.0f ms, but it rotated only %.1f deg (slid?)\n", peak, tipped_ms, rot_at_peak);
         fflush(stdout);
         return 1;
